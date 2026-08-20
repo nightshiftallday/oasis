@@ -38,17 +38,24 @@ void LocalSourceOperator::print(std::ostream &os) const {
 
 void DecodeColumnChunkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
     auto config = ctx.config<parcore::ColumnChunkDecoderConfig>();
-    config->enqueue_column_chunk(stream, compression_, num_values_, type_);
+    config->enqueue_column_chunk(stream, compression_, num_values_, type_, string_heap_address_);
 }
 
 void DecodeColumnChunkOperator::print(std::ostream &os) const {
     os << "DecodeColumnChunk(compression=" << compression_ << ", num_values=" << num_values_
-       << ", type=" << type_ << ")";
+       << ", type=" << type_;
+    if (string_heap_address_ != 0) {
+        os << ", heap=0x" << std::hex << string_heap_address_ << std::dec;
+    }
+    os << ")";
 }
 
-void LocalSinkOperator::apply(libstf::stream_t stream, OasisContext &ctx) {
+void LocalSinkOperator::apply(libstf::stream_t channel, OasisContext &ctx) {
     for (const auto &buffer : buffers_) {
-        ctx.enqueue_output_buffer(stream, *buffer);
+        ctx.enqueue_output_buffer(values_stream(channel), *buffer);
+    }
+    if (heap_buffer_) {
+        ctx.enqueue_output_buffer(heap_stream(channel), *heap_buffer_);
     }
 }
 
@@ -57,8 +64,11 @@ void LocalSinkOperator::print(std::ostream &os) const {
     for (const auto &buffer : buffers_) {
         bytes += buffer->size;
     }
-    os << "HostBufferSink(tag=" << tag_ << ", buffers=" << buffers_.size() << ", size=" << bytes
-       << ")";
+    os << "HostBufferSink(tag=" << tag_ << ", buffers=" << buffers_.size() << ", size=" << bytes;
+    if (heap_buffer_) {
+        os << ", heap=" << heap_buffer_->size;
+    }
+    os << ")";
 }
 
 } // namespace oasis

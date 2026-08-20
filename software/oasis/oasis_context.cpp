@@ -57,12 +57,26 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
         throw std::runtime_error(msg.str());
     }
 
-    auto cc_config = config<parcore::ColumnChunkDecoderConfig>();
-    // The hardware exposes one MemConfig stream per column-chunk decoder plus an extra bypass
-    // stream when RDMA is wired in. If the counts match, RDMA wasn't synthesized into this shell.
-    rdma_enabled_ = mem_config_->num_streams() != cc_config->num_decoders();
-
+    auto cc_config       = config<parcore::ColumnChunkDecoderConfig>();
     auto read_req_config = config<ReadReqConfig>();
+
+    // The hardware exposes one read-request stream (= one physical channel) per column-chunk
+    // decoder, plus an extra bypass channel when RDMA is wired in. If the counts match, RDMA wasn't
+    // synthesized into this shell. Deliberately not derived from MemConfig: PairedOutputWriter gives
+    // each channel two MemConfig slots, so that count is 2x the channel count either way.
+    rdma_enabled_ = false; // read_req_config->num_streams() != cc_config->num_decoders();
+
+    if (mem_config_->num_streams() !=
+        read_req_config->num_streams() * OUTPUT_STREAMS_PER_CHANNEL) {
+        std::ostringstream msg;
+        msg << "Hardware reports " << mem_config_->num_streams() << " output streams for "
+            << read_req_config->num_streams() << " channels; expected "
+            << OUTPUT_STREAMS_PER_CHANNEL
+            << " per channel (values + string heap). The bitstream and this host disagree about the "
+               "output-stream layout.";
+        throw std::runtime_error(msg.str());
+    }
+
     for (libstf::stream_t stream = 0; stream < read_req_config->num_streams(); ++stream) {
         read_req_config->set_ctid(stream, cthread_->getCtid());
     }
@@ -76,9 +90,10 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // Clear any stale buffers left enqueued in hardware from a previous run.
     mem_config_->flush_buffers();
 
-    // Stream scheduler.
+    // Stream scheduler. One description per *channel*; the two logical output streams that share it
+    // are the scheduler's business, not the hardware's.
     std::vector<StreamDescription> stream_descriptions;
-    stream_descriptions.reserve(mem_config_->num_streams());
+    stream_descriptions.reserve(read_req_config->num_streams());
     for (libstf::stream_t stream = 0; stream < cc_config->num_decoders(); ++stream) {
         stream_descriptions.push_back({StreamCapability::DECODE,
                                        cc_config->maximum_num_enqueued_configs(),
@@ -89,7 +104,7 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
                                        ReadReqConfig::MAXIMUM_NUM_ENQUEUED_REQUESTS,
                                        mem_config_->maximum_num_enqueued_buffers()});
     }
-    assert(stream_descriptions.size() == mem_config_->num_streams());
+    assert(stream_descriptions.size() == read_req_config->num_streams());
     scheduler_ = std::make_unique<Scheduler>(*this, std::move(stream_descriptions));
 }
 

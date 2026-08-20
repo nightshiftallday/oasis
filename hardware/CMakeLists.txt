@@ -28,7 +28,7 @@ else()
 endif()
 
 # Build with optimization, since timing closure can be difficult
-set(COMP_CORES 64)
+set(COMP_CORES 32)
 set(BUILD_OPT 1)
 
 # Target FPGA device (override with -DFDEV_NAME=v80 for the Alveo V80)
@@ -39,8 +39,12 @@ set(TLBL_BITS 30)
 
 validation_checks_hw()
 
+# ../celeris/hardware/src is omitted: the pinned celeris predates the libstf rename of
+# MAXIMUM_HOST_ALLOCATION_LEN_BIT -> MAXIMUM_BUFFER_SIZE, so its `common` package no longer
+# compiles. Nothing in src/ instantiates a celeris module, so this only removes dead sources.
+# Re-add once the celeris submodule is re-synced against this libstf.
 load_apps (
-    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src ../celeris/hardware/src"
+    VFPGA_C0_0 "src ../parcore/libstf/hardware/src ../parcore/vhsnunzip/src ../parcore/hardware/src"
 )
 
 create_hw()

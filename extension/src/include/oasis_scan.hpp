@@ -61,12 +61,24 @@ struct OasisScanBindData : public TableFunctionData {
 	string filename;
 	parcore::metadata::Metadata metadata;
 	shared_ptr<ParquetFileMetadataCache> parquet_metadata;
+
+	// Per column chunk, indexed [row_group][column]: the upper bound on that chunk's string heap.
+	// See BuildUncompressedSizes.
+	vector<vector<uint64_t>> uncompressed_sizes;
+
+	// The DuckDB logical type of each file column, in file column order. Needed at InitGlobal to
+	// decide whether a BYTE_ARRAY column is string_t-backed and can therefore take the german-string
+	// hardware path.
+	vector<LogicalType> column_types;
 };
 
 struct ProjectedColumn {
 	size_t column_id;
-	size_t elem_size; // 0 for CPU (string) columns
+	size_t elem_size; // 0 for CPU-path columns
 	bool is_cpu;      // variable-length column decoded on the CPU path, not the FPGA
+	// german-string column: decoded in hardware into 16-byte string_t records plus a separate
+	// string heap, so its flow writes on both of its channel's logical output streams.
+	bool is_string = false;
 };
 
 // Global scan state shared across all DuckDB worker threads of one read_oasis scan. Following
@@ -161,7 +173,7 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		std::vector<const parcore::metadata::ColumnChunk *> hw_chunks;
 		std::vector<CoalescedFetcher::RangeHandle> host_handles;
 
-		// CPU (string) columns of this group: Fetched over RDMA as raw bypass flows: cpu_slot[k]
+		// CPU-path columns of this group: Fetched over RDMA as raw bypass flows: cpu_slot[k]
         // is the projection index, cpu_chunks[k] the chunk.
 		std::vector<size_t> cpu_slot;
 		std::vector<const parcore::metadata::ColumnChunk *> cpu_chunks;
@@ -171,6 +183,9 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		size_t batches_remaining = 0;
 
 		std::vector<std::shared_ptr<libstf::Buffer>> hw_buffers;
+		// String heap per projection index; null for every column that is not a german-string
+		// column. A string column's records point into it, so it must outlive the values buffer.
+		std::vector<std::shared_ptr<libstf::Buffer>> heap_buffers;
 		std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> cpu_buffers;
 	};
 
@@ -179,6 +194,7 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	bool groups_exhausted = false;
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
+	std::vector<std::shared_ptr<libstf::Buffer>> current_heap_buffers;
 
 	// The current group's needs_row_filter mask (see PendingGroup), consumed by DecodeAndFilterSlice.
 	std::vector<bool> current_needs_row_filter;

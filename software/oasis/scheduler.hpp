@@ -1,5 +1,6 @@
 #pragma once
 
+#include "oasis/configuration.hpp"
 #include "oasis/query_splinter.hpp"
 #include "oasis/splinter_result.hpp"
 
@@ -83,10 +84,11 @@ class Scheduler {
     [[nodiscard]] size_t in_flight_flows() const;
 
     // Invoked from the interrupt switch for a stream interrupt. The hardware interrupts once per
-    // output buffer. This pops the front pending completion for that stream and pushes the
-    // corresponding buffer onto the splinter's result channel. The interrupt for the sink's final
-    // buffer concludes the flow (the hardware marks it with `last`) and runs the flow/splinter
-    // completion accounting.
+    // output buffer. `stream` is a *logical* output stream (see configuration.hpp): each channel has
+    // two, values and string heap, with independent hardware FIFOs. This pops the front pending
+    // completion for that logical stream and pushes the corresponding buffer onto the splinter's
+    // result channel. A flow concludes once every buffer it enqueued -- across both of its logical
+    // streams -- has been accounted for.
     void handle_completion(libstf::stream_t stream, uint32_t bytes_written, bool last);
 
   private:
@@ -95,53 +97,72 @@ class Scheduler {
         std::atomic<size_t>                    outstanding_flows;
     };
 
-    // One in-flight flow on a stream. It owns the flow's operators (including the sink's output
+    // One in-flight flow on a channel. It owns the flow's operators (including the sink's output
     // buffers) until reaped, plus a shared pointer to the splinter's completion record.
+    //
+    // `outstanding_buffers` is what concludes the flow. A string flow enqueues buffers on both of
+    // its channel's logical streams, which complete independently and in either order, so no single
+    // interrupt can be "the last one" -- the flow is done when this reaches zero. It is written by
+    // the dispatcher before the flow is enqueued to the hardware and decremented by the interrupt
+    // thread, so it is atomic; everything else here is guarded by the channel mutex.
     struct InFlight {
         OperatorFlow                        flow;
         std::shared_ptr<SplinterCompletion> completion;
+        std::atomic<size_t>                 outstanding_buffers{0};
         bool                                done = false;
     };
 
-    // One enqueued sink output buffer awaiting its hardware interrupt, recorded in the stream's
-    // FIFO in enqueue order. Holds everything handle_completion needs without re-locking the
-    // in-flight list: the buffer to surface, the tag, the splinter completion, a stable iterator
-    // to the owning in-flight slot, and whether this is the sink's final buffer (whose interrupt
-    // concludes the flow).
+    // One enqueued sink output buffer awaiting its hardware interrupt, recorded in its logical
+    // stream's FIFO in enqueue order. Holds everything handle_completion needs without re-locking
+    // the in-flight list: the buffer to surface, the tag, which logical stream it belongs to, the
+    // splinter completion, a stable iterator to the owning in-flight slot, and whether this is the
+    // final buffer *of its own logical stream* (which is what the hardware's `last` flag marks).
     struct PendingCompletion {
         std::shared_ptr<libstf::Buffer>     buffer;
-        size_t                              tag;
+        size_t                              tag  = 0;
+        OutputSlot                          slot = OutputSlot::VALUES;
         std::shared_ptr<SplinterCompletion> completion;
-        std::list<InFlight>::iterator       slot;
+        std::list<InFlight>::iterator       in_flight;
         bool                                last = false;
     };
 
-    // A queued flow waiting for the dispatcher to place it on a stream providing its capability.
-    // Carries the shared completion record of the splinter it belongs to and its sink's buffer
-    // count (the buffer-slot dispatch gate needs it before the flow is placed).
+    // A queued flow waiting for the dispatcher to place it on a channel providing its capability.
+    // Carries the shared completion record of the splinter it belongs to and its sink's buffer count
+    // per logical stream (the buffer-slot dispatch gate needs them before the flow is placed; the
+    // two streams have independent hardware FIFOs, so they are gated independently).
     struct Pending {
         OperatorFlow                        flow;
         std::shared_ptr<SplinterCompletion> completion;
-        StreamCapability                    capability  = StreamCapability::DECODE;
-        size_t                              num_buffers = 0;
+        StreamCapability                    capability = StreamCapability::DECODE;
+        std::array<size_t, OUTPUT_STREAMS_PER_CHANNEL> num_buffers{};
+
+        [[nodiscard]] size_t total_buffers() const {
+            return num_buffers[static_cast<size_t>(OutputSlot::VALUES)] +
+                   num_buffers[static_cast<size_t>(OutputSlot::HEAP)];
+        }
     };
 
-    // Per-stream pipeline: The stream's bounds (from its StreamDescription), the list of in-flight
-    // flows, and the count of flows/buffers currently enqueued on this stream. `enqueued` is the
-    // load-balancing metric and the flow FIFO gate. `enqueued_buffers` gates the OutputWRiter
-    // FIFO. Both are atomic and held under no lock: the dispatcher bumps them when it places a flow
-    // and the interrupt thread decrements them as completions land. Keeping them lock-free is what
-    // breaks the lock cycle -- handle_completion must never take dispatch_mutex_ while the
-    // dispatcher holds dispatch_mutex_ and is waiting for the stream mutex. `in_flight`/`done` are
-    // guarded by the stream mutex.
+    // Per-channel pipeline: The channel's bounds (from its StreamDescription), the list of in-flight
+    // flows, and the count of flows/buffers currently enqueued on it. `enqueued` is the
+    // load-balancing metric and the flow FIFO gate. `enqueued_buffers` gates the OutputWriter FIFO,
+    // per logical stream -- values and heap have separate hardware FIFOs, so a shared counter would
+    // be both wrong and needlessly conservative. All are atomic and held under no lock: the
+    // dispatcher bumps them when it places a flow and the interrupt thread decrements them as
+    // completions land. Keeping them lock-free is what breaks the lock cycle -- handle_completion
+    // must never take dispatch_mutex_ while the dispatcher holds dispatch_mutex_ and is waiting for
+    // the channel mutex. `in_flight`/`done` are guarded by the channel mutex.
+    //
+    // `completions` is per logical stream: the two streams complete independently and in either
+    // order, so one shared FIFO would mismatch a heap interrupt against a values buffer.
     struct StreamState {
-        std::mutex                    mutex;
-        std::list<InFlight>           in_flight;
-        std::deque<PendingCompletion> completions; // enqueued buffers awaiting interrupts, in order
-        std::atomic<size_t>           enqueued{0};
-        std::atomic<size_t>           enqueued_buffers{0};
-        size_t                        max_flows   = 1;
-        size_t                        max_buffers = 1;
+        std::mutex          mutex;
+        std::list<InFlight> in_flight;
+        // Enqueued buffers awaiting interrupts, in order, per logical stream.
+        std::array<std::deque<PendingCompletion>, OUTPUT_STREAMS_PER_CHANNEL> completions;
+        std::atomic<size_t>                                                   enqueued{0};
+        std::array<std::atomic<size_t>, OUTPUT_STREAMS_PER_CHANNEL>           enqueued_buffers{};
+        size_t                                                                max_flows   = 1;
+        size_t                                                                max_buffers = 1;
     };
 
     OasisContext                 &ctx_;
@@ -167,18 +188,20 @@ class Scheduler {
     // slots before measuring load.
     void dispatch_loop();
 
-    // Returns the least-loaded stream providing `capability` that can accept a flow whose sink
-    // spans `num_buffers` buffers (its flow gate and buffer gate both have room). For DECODE the
-    // candidates are the active span and the flow gate is the runtime pipeline depth; for other
-    // capabilities every providing stream is a candidate, gated by its hardware bounds. nullopt if
-    // none. Must be called holding dispatch_mutex_.
-    std::optional<libstf::stream_t> pick_stream(StreamCapability capability,
-                                                size_t           num_buffers) const;
+    // Returns the least-loaded channel providing `capability` that can accept a flow whose sink
+    // spans `num_buffers[slot]` buffers on each of its logical streams (its flow gate and both
+    // buffer gates have room). For DECODE the candidates are the active span and the flow gate is
+    // the runtime pipeline depth; for other capabilities every providing channel is a candidate,
+    // gated by its hardware bounds. nullopt if none. Must be called holding dispatch_mutex_.
+    std::optional<libstf::stream_t>
+    pick_stream(StreamCapability                                      capability,
+                const std::array<size_t, OUTPUT_STREAMS_PER_CHANNEL> &num_buffers) const;
 
-    // Applies a flow on `stream`: Records a pending completion per sink buffer and enqueues the
-    // buffers to the FPGA, parking the flow in the stream's in-flight list. Called only by the
-    // dispatcher, with a slot already reserved (enqueued/enqueued_buffers atomically bumped).
-    void dispatch_to(libstf::stream_t stream, Pending &pending);
+    // Applies a flow on `channel`: Records a pending completion per sink buffer, in its logical
+    // stream's FIFO, and enqueues the buffers to the FPGA, parking the flow in the channel's
+    // in-flight list. Called only by the dispatcher, with a slot already reserved
+    // (enqueued/enqueued_buffers atomically bumped).
+    void dispatch_to(libstf::stream_t channel, Pending &pending);
 
     // Splices `done` in-flight slots into `finished` (without destroying them, so the caller can
     // destroy them outside the locks -- keeping flow/buffer teardown off the scheduler locks).

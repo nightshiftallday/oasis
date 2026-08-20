@@ -1,5 +1,7 @@
 #pragma once
 
+#include "oasis/configuration.hpp"
+
 #include <libstf/buffer.hpp>
 
 #include <condition_variable>
@@ -18,27 +20,32 @@ namespace oasis {
  * here as the hardware finishes each one. The channel closes exactly once, when the last flow 
  * finishes -- so the splinter yields one completion.
  *
- * Buffers arrive in completion order across hardware streams, NOT in submission order, so each 
- * batch carries a `tag` (the sink's tag) identifying which output it is. The consumer may then 
- * reorder batches by tag if needed. It can start working on early batches while the hardware is 
+ * Buffers arrive in completion order across hardware streams, NOT in submission order, so each
+ * batch carries a `tag` (the sink's tag) identifying which output it is. The consumer may then
+ * reorder batches by tag if needed. It can start working on early batches while the hardware is
  * still producing later ones.
+ *
+ * A string flow produces batches on both of its channel's logical streams, and they share the sink's
+ * tag, so `slot` says which one a batch is: decoded values or the string heap they point into.
  */
 class SplinterResultChannel {
   public:
-    // One drained output buffer, tagged with its sink's tag (e.g. projected-column index).
+    // One drained output buffer, tagged with its sink's tag (e.g. projected-column index) and the
+    // logical output stream it came from.
     struct Batch {
-        size_t                          tag = 0;
+        size_t                          tag  = 0;
+        OutputSlot                      slot = OutputSlot::VALUES;
         std::shared_ptr<libstf::Buffer> buffer;
     };
 
     // Producer: Append one tagged batch. Ignored once the channel is closed.
-    void push_batch(size_t tag, std::shared_ptr<libstf::Buffer> buffer) {
+    void push_batch(size_t tag, OutputSlot slot, std::shared_ptr<libstf::Buffer> buffer) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (closed_) {
                 return;
             }
-            batches_.push_back(Batch{tag, std::move(buffer)});
+            batches_.push_back(Batch{tag, slot, std::move(buffer)});
         }
         cv_.notify_all();
     }

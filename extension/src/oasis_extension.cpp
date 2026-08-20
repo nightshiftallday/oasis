@@ -43,6 +43,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "submission with collection. Split across the scan's worker threads (each worker keeps "
 	    "ceil(value / threads) groups in flight but at least 1).",
 	    LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_GROUPS_IN_FLIGHT));
+	config.AddExtensionOption(
+	    "oasis_hardware_strings",
+	    "Decode BYTE_ARRAY (VARCHAR/BLOB) columns on the FPGA into german strings, handed to DuckDB "
+	    "zero-copy. Set to false to route every string column through DuckDB's own ColumnReader "
+	    "instead, which is the fallback ineligible columns already take.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);
