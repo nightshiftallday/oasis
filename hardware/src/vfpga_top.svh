@@ -1,5 +1,8 @@
 `timescale 1ns / 1ps
 
+`include "lynx_macros.svh"
+`include "libstf_macros.svh"
+
 import oasis::*;
 import parcore::*;
 
@@ -25,8 +28,15 @@ end
 
 localparam NUM_STREAMS        = N_STRM_AXI;
 localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
-// MemConfig write side needs NUM_STREAMS+1 regs, read side needs 3 (ID, num_streams, max_enqueued).
-localparam MEM_CONFIG_NUM_REGS = (NUM_STREAMS + 1 > 3) ? NUM_STREAMS + 1 : 3;
+
+// Each physical channel carries two logical output streams (PairedOutputWriter): values on
+// 2I, string heap on 2I+1. That indexing is also the mem_config slot and the interrupt
+// stream id, so software addresses output buffers by the same number.
+localparam NUM_OUTPUT_STREAMS = 2 * NUM_STREAMS;
+
+// MemConfig write side needs NUM_OUTPUT_STREAMS+1 regs, read side needs 3
+// (ID, num_streams, max_enqueued).
+localparam MEM_CONFIG_NUM_REGS = (NUM_OUTPUT_STREAMS + 1 > 3) ? NUM_OUTPUT_STREAMS + 1 : 3;
 
 localparam NUM_CONFIGS   = 3;
 `ifdef EN_RDMA
@@ -34,6 +44,12 @@ localparam NUM_DECODERS  = NUM_STREAMS - 1;
 `else
 localparam NUM_DECODERS  = NUM_STREAMS;
 `endif
+
+// StreamWriter encodes the logical stream id in irq_not_t.value[2:0], so 8 is the hard
+// ceiling (stream_writer.sv:71) and the pairing halves the number of channels that fit.
+// Fail here rather than deep inside StreamWriter's own ASSERT_ELAB, where the number no
+// longer looks like the decoder count.
+`ASSERT_ELAB(NUM_OUTPUT_STREAMS <= 8)
 
 // -- Fix clock and reset names --------------------------------------------------------------------
 logic clk;
@@ -45,7 +61,7 @@ assign rst_n = aresetn;
 // -- Configuration --------------------------------------------------------------------------------
 write_config_i                       write_configs[NUM_CONFIGS](.*);
 read_config_i                        read_configs [NUM_CONFIGS](.*);
-mem_config_i                         mem_conf[NUM_STREAMS](.*);
+mem_config_i                         mem_conf[NUM_OUTPUT_STREAMS](.*);
 ready_valid_i #(read_req_t)          read_conf[NUM_STREAMS](.*);
 logic [PID_BITS-1:0]                 read_ctid[NUM_STREAMS];
 ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_DECODERS](.*);
@@ -58,8 +74,7 @@ GlobalConfig #(
         MEM_CONFIG_NUM_REGS,
         COLUMN_CHUNK_DECODER_READ_REGS(NUM_DECODERS),
         NUM_READ_REQ_CONFIG_REGS * NUM_STREAMS
-    }),
-    .READ_CONFIG_SKID_DEPTH(2)
+    })
 ) inst_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -71,7 +86,7 @@ GlobalConfig #(
 );
 
 MemConfig #(
-    .NUM_STREAMS(NUM_STREAMS)
+    .NUM_STREAMS(NUM_OUTPUT_STREAMS)
 ) inst_mem_config (
     .clk(clk),
     .rst_n(rst_n),
@@ -124,12 +139,12 @@ MetaIntfArbiter #(
 );
 
 // -- Data path ------------------------------------------------------------------------------------
-AXI4S axi_out[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+AXI4S axi_out[NUM_OUTPUT_STREAMS](.aclk(clk), .aresetn(rst_n));
 for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
-    ndata_i       #(data8_t, DATABEAT_SIZE) decoder_in(.*);
-    typed_ndata_i #(DATABEAT_SIZE)          typed_out(.*);
-    ndata_i       #(data8_t, DATABEAT_SIZE) out(.*);
+    ndata_i #(data8_t, DATABEAT_SIZE) decoder_in(.*);
+    ndata_i #(data8_t, DATABEAT_SIZE) out(.*);
+    ndata_i #(data8_t, DATABEAT_SIZE) heap_out(.*);
 
 `ifdef EN_RDMA
     // AXI4SR to AXI4S
@@ -178,20 +193,29 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
         .conf(column_chunk_conf[I]),
 
         .in(decoder_in),
-        .out(typed_out),
+        .out(out),
+        .heap_out(heap_out),
 
         .profile(decoder_profiles[I])
     );
 
-    // Discard typed
-    `DATA_ASSIGN(typed_out, out);
-
+    // Values -> logical stream 2I.
     NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi (
         .clk(clk),
         .rst_n(rst_n),
 
         .in(out),
-        .out(axi_out[I])
+        .out(axi_out[2*I])
+    );
+
+    // String heap -> logical stream 2I+1. Idle for every chunk that is not a german string
+    // chunk, so nothing is written there and no interrupt is raised.
+    NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_heap (
+        .clk(clk),
+        .rst_n(rst_n),
+
+        .in(heap_out),
+        .out(axi_out[2*I+1])
     );
 end : gen_decoders
 
@@ -226,12 +250,17 @@ NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_bypass (
     .rst_n(rst_n),
 
     .in(bypass_ndata),
-    .out(axi_out[BYPASS_ID])
+    .out(axi_out[2*BYPASS_ID])
 );
+
+// The bypass channel is still a pair; its heap half has no producer.
+always_comb axi_out[2*BYPASS_ID+1].tie_off_m();
 `endif
 
 // -- Output writer --------------------------------------------------------------------------------
-OutputWriter inst_output_writer (
+PairedOutputWriter #(
+    .N_CHANNELS(NUM_STREAMS)
+) inst_output_writer (
     .clk(clk),
     .rst_n(rst_n),
 

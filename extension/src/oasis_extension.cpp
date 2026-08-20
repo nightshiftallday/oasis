@@ -62,6 +62,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "column directly to the narrow type. BIGINT columns need a bitstream whose decoders cast INT64 "
 	    "to INT32.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption(
+	    "oasis_hardware_strings",
+	    "Decode BYTE_ARRAY (VARCHAR/BLOB) columns on the FPGA into german strings, handed to DuckDB "
+	    "zero-copy. Set to false to route every string column through DuckDB's own ColumnReader "
+	    "instead, which is the fallback ineligible columns already take.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);

@@ -137,4 +137,21 @@ parcore::metadata::Metadata BuildParcoreMetadata(ParquetReader &parquet_reader) 
 	return meta;
 }
 
+vector<vector<uint64_t>> BuildUncompressedSizes(ParquetReader &parquet_reader) {
+	auto *file_meta = parquet_reader.GetFileMetadata();
+
+	vector<vector<uint64_t>> sizes;
+	sizes.reserve(file_meta->row_groups.size());
+	for (auto &rg : file_meta->row_groups) {
+		vector<uint64_t> group_sizes;
+		group_sizes.reserve(rg.columns.size());
+		for (auto &col_chunk : rg.columns) {
+			group_sizes.push_back(static_cast<uint64_t>(col_chunk.meta_data.total_uncompressed_size));
+		}
+		sizes.push_back(std::move(group_sizes));
+	}
+
+	return sizes;
+}
+
 } // namespace duckdb

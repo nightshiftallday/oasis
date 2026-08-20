@@ -44,6 +44,10 @@ public:
 
     /**
      * Maps the buffer into the hardware TLB and enqueues it to the output writer for `stream`.
+     *
+     * `stream` is a *logical* output stream (see values_stream()/heap_stream() in
+     * configuration.hpp), not a channel: each channel owns two, and they have independent
+     * output-writer FIFOs.
      */
     void enqueue_output_buffer(libstf::stream_t stream, libstf::Buffer &buffer);
 

@@ -34,6 +34,24 @@
 
 namespace duckdb {
 
+// The german-string hardware path hands the FPGA's output buffer straight to a vector as a
+// string_t array, with no conversion pass. That is only sound while libstf::german_str_t and
+// duckdb::string_t agree on their layout, so pin the agreement here rather than in a comment --
+// a DuckDB bump that changed it would otherwise be caught by nothing until the data was wrong.
+static_assert(sizeof(string_t) == 16, "string_t must be 16 bytes to alias german_str_t");
+static_assert(libstf::size_of(libstf::type_t::GERMAN_STR_T) == sizeof(string_t),
+              "german_str_t and string_t must be the same width");
+static_assert(string_t::PREFIX_BYTES == 4, "german_str_t stores a 4-byte prefix at offset 4");
+static_assert(string_t::INLINE_BYTES == 12, "german_str_t inlines strings of up to 12 bytes");
+// DUCKDB_DEBUG_NO_INLINE forces INLINE_LENGTH to 0, so string_t::GetData() dereferences
+// value.pointer.ptr for *every* non-empty string. The hardware still inlines everything up to 12
+// bytes, so each short string's own characters would be read back as a pointer. Fail the build
+// instead: this path cannot be used in such a configuration.
+#ifdef DUCKDB_DEBUG_NO_INLINE
+#error "The OASIS german-string path is incompatible with DUCKDB_DEBUG_NO_INLINE: the hardware \
+inlines strings of up to 12 bytes, which such a build would read as pointers."
+#endif
+
 namespace {
 
 class OasisSplinterResultTask : public AsyncTask {
@@ -73,6 +91,7 @@ unique_ptr<FunctionData> OasisScanBind(ClientContext &context, TableFunctionBind
 	}
 	bind_data->metadata = std::move(meta);
 	bind_data->filename = parquet_file;
+	bind_data->uncompressed_sizes = BuildUncompressedSizes(parquet_reader);
 
 	bind_data->parquet_metadata = parquet_reader.metadata;
 	bind_data->metadata_reader = ParquetReader::CreateMetadataReader(context, parquet_opts, parquet_reader.metadata);
@@ -180,6 +199,36 @@ static bool OasisScanPushdownCast(ClientContext &context, const TableFunctionPro
 	return true;
 }
 
+// Whether a BYTE_ARRAY column can take the german-string hardware path in every row group.
+//
+// Two gates. First, the logical type has to be one DuckDB backs with string_t, because the whole
+// point is that german_str_t *is* string_t and the values buffer becomes the vector's data with no
+// conversion. A BYTE_ARRAY carrying, say, a JSON or UUID logical type still needs DuckDB's own
+// conversion and stays on the CPU path.
+//
+// Second, the heap has to fit one FPGA output buffer, in *every* group: the decoder walks the heap
+// linearly from a single base address, so a heap spilling into a second allocation would produce
+// records pointing outside it. Deciding this once per scan rather than per group keeps a column's
+// path stable -- the emit path would otherwise have to switch a column between the hardware and CPU
+// readers mid-scan, and the CPU reader's page state only exists if it was driven from the start.
+static bool StringColumnFitsHardware(const OasisScanBindData &bind, size_t col_id) {
+	const auto &type = bind.column_types[col_id];
+	if (type.id() != LogicalTypeId::VARCHAR && type.id() != LogicalTypeId::BLOB) {
+		return false;
+	}
+	for (size_t group = 0; group < bind.metadata.groups.size(); group++) {
+		const auto &chunk = bind.metadata.groups[group].chunks[col_id];
+		if (chunk.num_values * libstf::size_of(libstf::type_t::GERMAN_STR_T) >
+		    libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE) {
+			return false;
+		}
+		if (bind.uncompressed_sizes[group][col_id] > libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE) {
+			return false;
+		}
+	}
+	return true;
+}
+
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<OasisScanBindData>();
 	auto &ctx = GetOrCreateOasisContext(context);
@@ -194,6 +243,13 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	if (input.op && input.op->type == PhysicalOperatorType::TABLE_SCAN) {
 		gstate->physical_scan = &input.op->Cast<PhysicalTableScan>();
 	}
+
+	// Kill switch for the german-string hardware path, so a regression there is one SET away from
+	// being isolated: with it off every string column takes the CPU fallback that ineligible
+	// columns already use.
+	Value hardware_strings_val;
+	context.TryGetCurrentSetting("oasis_hardware_strings", hardware_strings_val);
+	bool const hardware_strings = hardware_strings_val.IsNull() || hardware_strings_val.GetValue<bool>();
 
 	Value groups_in_flight_val;
 	context.TryGetCurrentSetting("oasis_prefetch_depth", groups_in_flight_val);
@@ -235,9 +291,15 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			    (column_type.id() == LogicalTypeId::BIGINT ||
 			     (column_type.id() == LogicalTypeId::DECIMAL && column_type.InternalType() == PhysicalType::INT64));
 			gstate->projected_columns.push_back({col_id, duckdb_size, false, narrowable, cast_type});
+		} else if (hardware_strings && parcore::metadata::is_string_type(chunk.type) &&
+		           StringColumnFitsHardware(bind_data, col_id)) {
+			// Hardware path: BYTE_ARRAY decoded into german_str_t records, which are bit-for-bit
+			// duckdb::string_t, plus a string heap the records point into.
+			gstate->projected_columns.push_back(
+			    {col_id, libstf::size_of(libstf::type_t::GERMAN_STR_T), false, false, std::nullopt, true});
 		} else {
-			// CPU path: Variable-length type (BYTE_ARRAY/string) decoded by DuckDB's ColumnReader.
-			gstate->projected_columns.push_back({col_id, 0, true});
+			// CPU path: Variable-length type decoded by DuckDB's ColumnReader.
+			gstate->projected_columns.push_back({col_id, 0, true, false});
 			gstate->has_cpu_columns = true;
 		}
 	}
@@ -454,6 +516,8 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	// load-balances the flows across the hardware streams and closes the handle once all finish.
 	oasis::QuerySplinter splinter;
 	splinter.streams.reserve(pending.hw_slot.size() + pending.cpu_slot.size());
+	pending.heap_buffers.assign(gstate.projected_columns.size(), nullptr);
+	pending.batches_remaining = pending.hw_slot.size();
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
 		const auto &cc = *pending.hw_chunks[k];
 		const auto &col = gstate.projected_columns[pending.hw_slot[k]];
@@ -467,13 +531,28 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 		} else {
 			flow.push_back(MakeHostSource(pending.fetcher->Resolve(pending.host_handles[k])));
 		}
+
+		// A string column decodes into two buffers: the german_str_t records, and the heap the
+		// records with strings longer than 12 bytes point into. The decoder embeds absolute host
+		// addresses, so it needs the heap's base address at config time -- which means the buffer
+		// has to be allocated before the decode operator is built.
+		std::shared_ptr<libstf::Buffer> heap_buffer;
+		uint64_t heap_address = 0;
+		if (col.is_string) {
+			heap_buffer = ctx.allocate_output_buffer(bind.uncompressed_sizes[group][col.column_id]);
+			heap_address = reinterpret_cast<uintptr_t>(heap_buffer->ptr);
+			pending.heap_buffers[pending.hw_slot[k]] = heap_buffer;
+			pending.batches_remaining++;
+		}
+
 		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type,
-		                                                                   cc.is_required, logical_type));
+		                                                                   cc.is_required, logical_type,
+		                                                                   heap_address));
 		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(logical_type));
-		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k]));
+		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k],
+		                                                          std::move(heap_buffer)));
 		splinter.streams.push_back(std::move(flow));
 	}
-	pending.batches_remaining = pending.hw_slot.size();
 
 	// Raw fetch of each CPU column's compressed bytes: an RDMA source writing directly into one
 	// sink whose buffers split the transfer into FPGA output-buffer-sized chunks, tagged with the
@@ -498,8 +577,8 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	pending.hw_buffers.assign(gstate.projected_columns.size(), nullptr);
 	pending.cpu_buffers.assign(gstate.projected_columns.size(), {});
 
-	// A group with nothing to fetch or decode in hardware (e.g. a string-only projection on the
-	// local path) submits no splinter and leaves `result` default-constructed.
+	// A group with nothing to fetch or decode in hardware (a projection consisting only of columns
+	// that fell back to the CPU path) submits no splinter and leaves `result` default-constructed.
 	if (pending.batches_remaining == 0) {
 		return;
 	}
@@ -511,7 +590,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	                 (unsigned long long)group);
 }
 
-// Positions the shared CPU readers at the start of `group`'s CPU/string columns (page-header
+// Positions the shared CPU readers at the start of `group`'s CPU-path columns (page-header
 // parsing / I/O positioning) and bulk-prefetches their column-chunk bytes.
 //
 // Without this prefetch the thrift transport falls back to a raw synchronous file read for every
@@ -571,11 +650,23 @@ static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate
 			                        (unsigned long long)pending.batches_remaining);
 		}
 		size_t const tag = poll.batch->tag;
-		size_t const col_id = gstate.projected_columns[tag].column_id;
-		DUCKDB_LOG_DEBUG(context, "Row group %llu, column %llu ('%s') returned batch",
+		const auto &col = gstate.projected_columns[tag];
+		size_t const col_id = col.column_id;
+		DUCKDB_LOG_DEBUG(context, "Row group %llu, column %llu ('%s') returned %s batch",
 		                 (unsigned long long)pending.group, (unsigned long long)col_id,
-		                 bind.metadata.column_names[col_id].c_str());
-		if (gstate.projected_columns[tag].is_cpu) {
+		                 bind.metadata.column_names[col_id].c_str(),
+		                 poll.batch->slot == oasis::OutputSlot::HEAP ? "heap" : "values");
+		if (poll.batch->slot == oasis::OutputSlot::HEAP) {
+			// The heap buffer was allocated at submission and is already in heap_buffers; the batch
+			// carries the same buffer back with its written size filled in. More than one would mean
+			// the heap spilled across allocations, which would leave the records pointing outside
+			// the buffer the decoder was given -- StringColumnFitsHardware is supposed to prevent it.
+			if (!col.is_string || pending.heap_buffers[tag] != poll.batch->buffer) {
+				throw InternalException("Row group %llu, column %llu ('%s') produced an unexpected heap batch",
+				                        (unsigned long long)pending.group, (unsigned long long)col_id,
+				                        bind.metadata.column_names[col_id].c_str());
+			}
+		} else if (col.is_cpu) {
 			pending.cpu_buffers[tag].push_back(std::move(poll.batch->buffer));
 		} else {
 			pending.hw_buffers[tag] = std::move(poll.batch->buffer);
@@ -649,8 +740,8 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 
 	auto &head = *lstate.inflight.front();
 
-	// A group with nothing to fetch or decode in hardware (string-only projection on the local
-	// path) submitted no splinter, so skip straight to loading the string columns.
+	// A group with nothing to fetch or decode in hardware (a projection of CPU-path columns only)
+	// submitted no splinter, so skip straight to loading those columns.
 	if (head.submitted) {
 		if (gstate.synchronous) {
 			while (!TryCollectGroup(context, gstate, bind, head)) {
@@ -671,6 +762,7 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 
 	lstate.current_buffers = std::move(head.hw_buffers);
 	lstate.current_narrowed = std::move(head.narrowed);
+	lstate.current_heap_buffers = std::move(head.heap_buffers);
 	lstate.current_needs_row_filter = std::move(head.needs_row_filter);
 	lstate.current_buf_offset = 0;
 	lstate.current_group_num_rows = head.num_rows;
@@ -789,6 +881,20 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		FlatVector::SetData(vec, reinterpret_cast<data_ptr_t>(buf->ptr) + lstate.current_buf_offset * col.elem_size,
 		                    count_t(emit));
 		vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
+
+		// A german-string column needs no conversion pass -- german_str_t is byte-for-byte
+		// duckdb::string_t, so the buffer above already *is* a string_t array. What it does need is
+		// a second lifetime holder: records longer than 12 bytes hold absolute pointers into the
+		// heap buffer, so the heap has to outlive the vector exactly as the values do.
+		// AddAuxiliaryData appends to a set rather than replacing, so both stay pinned, and
+		// Vector::AddHeapReference carries the whole set when a downstream operator references it.
+		if (col.is_string) {
+			auto &heap = lstate.current_heap_buffers[i];
+			if (!heap) {
+				throw InternalException("String column %llu has no string heap buffer", (unsigned long long)i);
+			}
+			vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(heap));
+		}
 	}
 
 	// Decode the CPU columns and apply the pushed-down filters (late-materialized: Filter columns
@@ -801,6 +907,7 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	lstate.current_buf_offset += emit;
 	if (lstate.current_buf_offset >= total_elements) {
 		lstate.current_buffers.assign(gstate.projected_columns.size(), nullptr);
+		lstate.current_heap_buffers.assign(gstate.projected_columns.size(), nullptr);
 		lstate.current_buf_offset = 0;
 		lstate.current_group_num_rows = 0;
 	}
@@ -916,7 +1023,10 @@ void OasisScanGetMetrics(TableFunctionGetMetricsInput &input) {
 		input.operator_metrics.AddExtraInfo("Filter Time", seconds(gstate.filter_time_ns.load()));
 	}
 	if (gstate.has_cpu_columns) {
-		input.operator_metrics.AddExtraInfo("String Decode Time", seconds(gstate.string_decode_time_ns.load()));
+		// Only the columns that fell back to DuckDB's ColumnReader. String columns eligible for the
+		// german-string hardware path cost nothing here -- they are decoded on the FPGA and handed
+		// over zero-copy -- so this metric is absent when every column took a hardware path.
+		input.operator_metrics.AddExtraInfo("CPU Decode Time", seconds(gstate.string_decode_time_ns.load()));
 	}
 }
 
