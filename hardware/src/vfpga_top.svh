@@ -34,9 +34,9 @@ localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
 // stream id, so software addresses output buffers by the same number.
 localparam NUM_OUTPUT_STREAMS = 2 * NUM_STREAMS;
 
-// MemConfig write side needs NUM_OUTPUT_STREAMS+1 regs, read side needs 3
-// (ID, num_streams, max_enqueued).
-localparam MEM_CONFIG_NUM_REGS = (NUM_OUTPUT_STREAMS + 1 > 3) ? NUM_OUTPUT_STREAMS + 1 : 3;
+// MemConfig write side needs NUM_OUTPUT_STREAMS+1 regs, read side needs 4
+// (ID, num_streams, max_enqueued, empty_stream_consumes_buffer).
+localparam MEM_CONFIG_NUM_REGS = (NUM_OUTPUT_STREAMS + 1 > 4) ? NUM_OUTPUT_STREAMS + 1 : 4;
 
 localparam NUM_CONFIGS   = 3;
 `ifdef EN_RDMA
@@ -85,8 +85,11 @@ GlobalConfig #(
     .read_configs(read_configs)
 );
 
+// Software enqueues one buffer per output stream of a flow ahead of time, so the empty heap stream of
+// a string chunk without long strings has to consume its buffer as well.
 MemConfig #(
-    .NUM_STREAMS(NUM_OUTPUT_STREAMS)
+    .NUM_STREAMS(NUM_OUTPUT_STREAMS),
+    .EMPTY_STREAM_CONSUMES_BUFFER(1)
 ) inst_mem_config (
     .clk(clk),
     .rst_n(rst_n),

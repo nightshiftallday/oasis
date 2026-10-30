@@ -64,7 +64,7 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
     // decoder, plus an extra bypass channel when RDMA is wired in. If the counts match, RDMA wasn't
     // synthesized into this shell. Deliberately not derived from MemConfig: PairedOutputWriter gives
     // each channel two MemConfig slots, so that count is 2x the channel count either way.
-    rdma_enabled_ = false; // read_req_config->num_streams() != cc_config->num_decoders();
+    rdma_enabled_ = read_req_config->num_streams() != cc_config->num_decoders();
 
     if (mem_config_->num_streams() !=
         read_req_config->num_streams() * OUTPUT_STREAMS_PER_CHANNEL) {
