@@ -39,7 +39,7 @@ namespace duckdb {
 // duckdb::string_t agree on their layout, so pin the agreement here rather than in a comment --
 // a DuckDB bump that changed it would otherwise be caught by nothing until the data was wrong.
 static_assert(sizeof(string_t) == 16, "string_t must be 16 bytes to alias german_str_t");
-static_assert(libstf::size_of(libstf::type_t::GERMAN_STR_T) == sizeof(string_t),
+static_assert(libstf::size_of(parcore::metadata::GERMAN_STR_T) == sizeof(string_t),
               "german_str_t and string_t must be the same width");
 static_assert(string_t::PREFIX_BYTES == 4, "german_str_t stores a 4-byte prefix at offset 4");
 static_assert(string_t::INLINE_BYTES == 12, "german_str_t inlines strings of up to 12 bytes");
@@ -218,7 +218,7 @@ static bool StringColumnFitsHardware(const OasisScanBindData &bind, size_t col_i
 	}
 	for (size_t group = 0; group < bind.metadata.groups.size(); group++) {
 		const auto &chunk = bind.metadata.groups[group].chunks[col_id];
-		if (chunk.num_values * libstf::size_of(libstf::type_t::GERMAN_STR_T) >
+		if (chunk.num_values * libstf::size_of(parcore::metadata::GERMAN_STR_T) >
 		    libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE) {
 			return false;
 		}
@@ -296,7 +296,7 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			// Hardware path: BYTE_ARRAY decoded into german_str_t records, which are bit-for-bit
 			// duckdb::string_t, plus a string heap the records point into.
 			gstate->projected_columns.push_back(
-			    {col_id, libstf::size_of(libstf::type_t::GERMAN_STR_T), false, false, std::nullopt, true});
+			    {col_id, libstf::size_of(parcore::metadata::GERMAN_STR_T), false, false, std::nullopt, true});
 		} else {
 			// CPU path: Variable-length type decoded by DuckDB's ColumnReader.
 			gstate->projected_columns.push_back({col_id, 0, true, false});

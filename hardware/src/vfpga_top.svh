@@ -142,17 +142,32 @@ MetaIntfArbiter #(
 );
 
 // -- Data path ------------------------------------------------------------------------------------
-AXI4S axi_out[NUM_OUTPUT_STREAMS](.aclk(clk), .aresetn(rst_n));
+AXI4S axi_produced[NUM_OUTPUT_STREAMS](.aclk(clk), .aresetn(rst_n));
+AXI4S axi_out     [NUM_OUTPUT_STREAMS](.aclk(clk), .aresetn(rst_n));
 for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
     ndata_i #(data8_t, DATABEAT_SIZE) decoder_in(.*);
     ndata_i #(data8_t, DATABEAT_SIZE) out(.*);
     ndata_i #(data8_t, DATABEAT_SIZE) heap_out(.*);
 
-`ifdef EN_RDMA
-    // AXI4SR to AXI4S
-    `AXIS_ASSIGN(axis_rreq_recv[I], axi_in)
+    AXI4S axi_recv (.aclk(aclk), .aresetn(aresetn));
 
+    // AXI4SR to AXI4S
+`ifdef EN_RDMA
+    `AXIS_ASSIGN(axis_rreq_recv[I], axi_recv)
+`else
+    `AXIS_ASSIGN(axis_host_recv[I], axi_recv)
+`endif
+
+    AXISkidBuffer inst_recv_skid_buffer (
+        .clk(clk),
+        .rst_n(rst_n),
+
+        .in(axi_recv),
+        .out(axi_in)
+    );
+
+`ifdef EN_RDMA
     RDMARead #(
         .AXI_STRM_ID(I),
         .DATABEAT_SIZE(DATABEAT_SIZE)
@@ -169,9 +184,6 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
         .out(decoder_in)
     );
 `else
-    // AXI4SR to AXI4S
-    `AXIS_ASSIGN(axis_host_recv[I], axi_in)
-
     LocalRead #(
         .AXI_STRM_ID(I),
         .DATABEAT_SIZE(DATABEAT_SIZE)
@@ -208,7 +220,7 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
         .rst_n(rst_n),
 
         .in(out),
-        .out(axi_out[2*I])
+        .out(axi_produced[2*I])
     );
 
     // String heap -> logical stream 2I+1. Idle for every chunk that is not a german string
@@ -218,7 +230,7 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
         .rst_n(rst_n),
 
         .in(heap_out),
-        .out(axi_out[2*I+1])
+        .out(axi_produced[2*I+1])
     );
 end : gen_decoders
 
@@ -253,14 +265,26 @@ NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_bypass (
     .rst_n(rst_n),
 
     .in(bypass_ndata),
-    .out(axi_out[2*BYPASS_ID])
+    .out(axi_produced[2*BYPASS_ID])
 );
 
 // The bypass channel is still a pair; its heap half has no producer.
-always_comb axi_out[2*BYPASS_ID+1].tie_off_m();
+always_comb axi_produced[2*BYPASS_ID+1].tie_off_m();
 `endif
 
 // -- Output writer --------------------------------------------------------------------------------
+for (genvar I = 0; I < NUM_OUTPUT_STREAMS; I++) begin : gen_out_skid_buffers
+    AXISkidBuffer inst_out_skid_buffer (
+        .clk(clk),
+        .rst_n(rst_n),
+
+        .in(axi_produced[I]),
+        .out(axi_out[I])
+    );
+end
+
+AXI4SR axi_send[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
+
 PairedOutputWriter #(
     .N_CHANNELS(NUM_STREAMS)
 ) inst_output_writer (
@@ -274,5 +298,35 @@ PairedOutputWriter #(
     .mem_config(mem_conf),
 
     .data_in(axi_out),
-    .data_out(axis_host_send)
+    .data_out(axi_send)
 );
+
+typedef struct packed {
+    logic [AXI_DATA_BITS - 1:0]     tdata;
+    logic [AXI_DATA_BITS / 8 - 1:0] tkeep;
+    logic [PID_BITS - 1:0]          tid;
+    logic                           tlast;
+} axisr_beat_t;
+
+for (genvar I = 0; I < NUM_STREAMS; I++) begin : gen_send_skid_buffers
+    ready_valid_i #(axisr_beat_t) send_in(clk, rst_n), send_out(clk, rst_n);
+
+    assign send_in.data       = '{axi_send[I].tdata, axi_send[I].tkeep, axi_send[I].tid, axi_send[I].tlast};
+    assign send_in.valid      = axi_send[I].tvalid;
+    assign axi_send[I].tready = send_in.ready;
+
+    SkidBuffer #(axisr_beat_t) inst_send_skid_buffer (
+        .clk(clk),
+        .rst_n(rst_n),
+
+        .in(send_in),
+        .out(send_out)
+    );
+
+    assign axis_host_send[I].tdata  = send_out.data.tdata;
+    assign axis_host_send[I].tkeep  = send_out.data.tkeep;
+    assign axis_host_send[I].tid    = send_out.data.tid;
+    assign axis_host_send[I].tlast  = send_out.data.tlast;
+    assign axis_host_send[I].tvalid = send_out.valid;
+    assign send_out.ready           = axis_host_send[I].tready;
+end
