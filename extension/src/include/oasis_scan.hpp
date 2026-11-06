@@ -10,6 +10,7 @@
 #include "parcore/metadata/metadata.hpp"
 #include "parquet_reader.hpp"
 
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/parallel/async_result.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 
@@ -218,6 +219,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		// String heap per projection index; null for every column that is not a german-string
 		// column. A string column's records point into it, so it must outlive the values buffer.
 		std::vector<std::shared_ptr<libstf::Buffer>> heap_buffers;
+		// String dictionary per projection index; null unless the column's chunk of this group is
+		// dictionary encoded. Then hw_buffers holds one uint32_t index per row into it, and the
+		// column is emitted as a DuckDB dictionary vector.
+		std::vector<std::shared_ptr<libstf::Buffer>> dict_buffers;
 		std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> cpu_buffers;
 	};
 
@@ -227,6 +232,12 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 	std::vector<std::shared_ptr<libstf::Buffer>> current_heap_buffers;
+
+	// Per projection index: the current group's dictionary for a dictionary encoded string column,
+	// null otherwise. One entry per column chunk, shared by all of the group's vectors of that column
+	// so that operators can cache per dictionary id. Its child vector wraps the dictionary buffer and
+	// pins it and the string heap.
+	std::vector<buffer_ptr<DictionaryEntry>> current_dictionaries;
 
 	// The current group's narrowed flags (see PendingGroup).
 	std::vector<bool> current_narrowed;

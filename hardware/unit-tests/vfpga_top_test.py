@@ -61,12 +61,20 @@ READ_REQ_REGS_PER_STREAM = 3
 # addresses to this.
 DATABEAT_SIZE = 64
 
+# PairedOutputWriter: values on 3I, string heap on 3I+1, string dictionary on 3I+2.
+OUTPUTS_PER_CHANNEL = 3
+
+
 def values_stream(decoder: int) -> int:
-    return 2 * decoder
+    return OUTPUTS_PER_CHANNEL * decoder
 
 
 def heap_stream(decoder: int) -> int:
-    return 2 * decoder + 1
+    return OUTPUTS_PER_CHANNEL * decoder + 1
+
+
+def dict_stream(decoder: int) -> int:
+    return OUTPUTS_PER_CHANNEL * decoder + 2
 
 
 def _register_value(value: int) -> bytearray:

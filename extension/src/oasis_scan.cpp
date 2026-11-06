@@ -3,6 +3,7 @@
 #include "coalesced_fetcher.hpp"
 #include "column_reader.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include "duckdb/common/multi_file/multi_file_options.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "duckdb/function/partition_stats.hpp"
@@ -440,6 +441,16 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 // hw_buffers[projection_index] / cpu_buffers[projection_index]. For RDMA, the hardware pulls bytes
 // straight into the streams. On the local path the hardware-column bytes are read coalesced, 
 // synchronously on the worker, before submission.
+// Upper bound of the dictionary buffer of a dictionary encoded string chunk. The host never parses
+// the dictionary page header, so the entry count is bounded from the footer: every PLAIN entry
+// carries a 4-byte length prefix within the chunk's uncompressed bytes, and a writer only adds
+// values it saw, so there are no more entries than values. The written size is reported back.
+static uint64_t DictionaryBufferSize(const OasisScanBindData &bind, size_t group, size_t col_id,
+                                     const parcore::metadata::ColumnChunk &cc) {
+	uint64_t const max_entries = std::min<uint64_t>(cc.num_values, bind.uncompressed_sizes[group][col_id] / 4);
+	return max_entries * libstf::size_of(parcore::metadata::GERMAN_STR_T);
+}
+
 static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                           OasisScanLocalState &lstate, const OasisScanBindData &bind,
                           OasisScanLocalState::PendingGroup &pending) {
@@ -517,6 +528,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	oasis::QuerySplinter splinter;
 	splinter.streams.reserve(pending.hw_slot.size() + pending.cpu_slot.size());
 	pending.heap_buffers.assign(gstate.projected_columns.size(), nullptr);
+	pending.dict_buffers.assign(gstate.projected_columns.size(), nullptr);
 	pending.batches_remaining = pending.hw_slot.size();
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
 		const auto &cc = *pending.hw_chunks[k];
@@ -545,12 +557,26 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 			pending.batches_remaining++;
 		}
 
+		// A dictionary encoded string chunk decodes into a DuckDB dictionary vector instead: one
+		// uint32_t index per row in the values buffer, plus the dictionary page's german_str_t
+		// records in a third buffer. The decoder recognizes such a chunk from its dictionary page,
+		// so this has to agree with the encodings in the footer (no PLAIN fallback, as DuckDB
+		// writes them).
+		std::shared_ptr<libstf::Buffer> dict_buffer;
+		bool const dict_vector = col.is_string && cc.is_dictionary_encoded;
+		if (dict_vector) {
+			dict_buffer = ctx.allocate_output_buffer(DictionaryBufferSize(bind, group, col.column_id, cc));
+			pending.dict_buffers[pending.hw_slot[k]] = dict_buffer;
+			pending.batches_remaining++;
+		}
+
 		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type,
 		                                                                   cc.is_required, logical_type,
 		                                                                   heap_address));
-		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * libstf::size_of(logical_type));
+		size_t const value_size = dict_vector ? sizeof(sel_t) : libstf::size_of(logical_type);
+		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * value_size);
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k],
-		                                                          std::move(heap_buffer)));
+		                                                          std::move(heap_buffer), std::move(dict_buffer)));
 		splinter.streams.push_back(std::move(flow));
 	}
 
@@ -655,8 +681,18 @@ static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate
 		DUCKDB_LOG_DEBUG(context, "Row group %llu, column %llu ('%s') returned %s batch",
 		                 (unsigned long long)pending.group, (unsigned long long)col_id,
 		                 bind.metadata.column_names[col_id].c_str(),
-		                 poll.batch->slot == oasis::OutputSlot::HEAP ? "heap" : "values");
-		if (poll.batch->slot == oasis::OutputSlot::HEAP) {
+		                 poll.batch->slot == oasis::OutputSlot::HEAP   ? "heap"
+		                 : poll.batch->slot == oasis::OutputSlot::DICT ? "dictionary"
+		                                                               : "values");
+		if (poll.batch->slot == oasis::OutputSlot::DICT) {
+			// Like the heap, the dictionary buffer was allocated at submission; the batch carries it
+			// back with its written size, which gives the number of dictionary entries.
+			if (!pending.dict_buffers[tag] || pending.dict_buffers[tag] != poll.batch->buffer) {
+				throw InternalException("Row group %llu, column %llu ('%s') produced an unexpected dictionary batch",
+				                        (unsigned long long)pending.group, (unsigned long long)col_id,
+				                        bind.metadata.column_names[col_id].c_str());
+			}
+		} else if (poll.batch->slot == oasis::OutputSlot::HEAP) {
 			// The heap buffer was allocated at submission and is already in heap_buffers; the batch
 			// carries the same buffer back with its written size filled in. More than one would mean
 			// the heap spilled across allocations, which would leave the records pointing outside
@@ -763,6 +799,33 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	lstate.current_buffers = std::move(head.hw_buffers);
 	lstate.current_narrowed = std::move(head.narrowed);
 	lstate.current_heap_buffers = std::move(head.heap_buffers);
+	lstate.current_dictionaries.assign(gstate.projected_columns.size(), nullptr);
+	for (size_t i = 0; i < head.dict_buffers.size(); i++) {
+		auto &dict = head.dict_buffers[i];
+		if (!dict) {
+			continue;
+		}
+		if (dict->size % sizeof(string_t) != 0) {
+			throw InternalException("Row group %llu, column %llu: dictionary of %llu bytes is not a string_t array",
+			                        (unsigned long long)head.group, (unsigned long long)i,
+			                        (unsigned long long)dict->size);
+		}
+		// Zero-copy: the entry's child vector is the hardware-written string_t array. It pins the
+		// dictionary and the heap its records point into, for as long as any vector uses the entry.
+		auto &heap = lstate.current_heap_buffers[i];
+		if (!heap) {
+			throw InternalException("Dictionary encoded string column %llu has no string heap buffer",
+			                        (unsigned long long)i);
+		}
+		// VARCHAR or BLOB: Vector::Dictionary requires the entry to have the vector's type.
+		const auto &type = bind.column_types[gstate.projected_columns[i].column_id];
+		idx_t const dict_size = dict->size / sizeof(string_t);
+		auto entry = make_buffer<DictionaryEntry>(Vector(type, reinterpret_cast<data_ptr_t>(dict->ptr), dict_size));
+		entry->data.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(dict));
+		entry->data.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(heap));
+		entry->id = UUID::ToString(UUID::GenerateRandomUUID());
+		lstate.current_dictionaries[i] = std::move(entry);
+	}
 	lstate.current_needs_row_filter = std::move(head.needs_row_filter);
 	lstate.current_buf_offset = 0;
 	lstate.current_group_num_rows = head.num_rows;
@@ -835,7 +898,8 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 
 		auto &buf = lstate.current_buffers[i];
 		const bool narrowed = lstate.current_narrowed[i];
-		const size_t transfer_size = narrowed ? sizeof(int32_t) : col.elem_size;
+		auto &dictionary = lstate.current_dictionaries[i];
+		const size_t transfer_size = narrowed || dictionary ? sizeof(int32_t) : col.elem_size;
 		if (buf->size / transfer_size != total_elements) {
 			throw InternalException(
 			    "ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
@@ -844,6 +908,18 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		}
 
 		auto &vec = scan_chunk.data[i];
+
+		// Dictionary encoded string column: the selection is a slice of the hardware-written index
+		// buffer (sel_t is uint32_t) over the group's shared dictionary, zero-copy as well. The
+		// DictionaryBuffer keeps only a pointer to the selection, so the index buffer is pinned on it.
+		// The indices are not bounds checked: files are assumed not to be corrupted.
+		if (dictionary) {
+			SelectionVector sel(reinterpret_cast<sel_t *>(buf->ptr) + lstate.current_buf_offset, emit);
+			vec.Dictionary(dictionary, sel, emit);
+			vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
+			continue;
+		}
+
 		vec.SetVectorType(VectorType::FLAT_VECTOR);
 
 		// A chunk transferred as INT32 is sign-extended into the vector's own memory (the reset
@@ -908,6 +984,7 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 	if (lstate.current_buf_offset >= total_elements) {
 		lstate.current_buffers.assign(gstate.projected_columns.size(), nullptr);
 		lstate.current_heap_buffers.assign(gstate.projected_columns.size(), nullptr);
+		lstate.current_dictionaries.assign(gstate.projected_columns.size(), nullptr);
 		lstate.current_buf_offset = 0;
 		lstate.current_group_num_rows = 0;
 	}

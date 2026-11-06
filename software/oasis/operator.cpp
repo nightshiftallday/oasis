@@ -59,6 +59,9 @@ void LocalSinkOperator::apply(libstf::stream_t channel, OasisContext &ctx) {
     if (heap_buffer_) {
         ctx.enqueue_output_buffer(heap_stream(channel), *heap_buffer_);
     }
+    if (dict_buffer_) {
+        ctx.enqueue_output_buffer(dict_stream(channel), *dict_buffer_);
+    }
 }
 
 void LocalSinkOperator::print(std::ostream &os) const {
@@ -69,6 +72,9 @@ void LocalSinkOperator::print(std::ostream &os) const {
     os << "HostBufferSink(tag=" << tag_ << ", buffers=" << buffers_.size() << ", size=" << bytes;
     if (heap_buffer_) {
         os << ", heap=" << heap_buffer_->size;
+    }
+    if (dict_buffer_) {
+        os << ", dict=" << dict_buffer_->size;
     }
     os << ")";
 }

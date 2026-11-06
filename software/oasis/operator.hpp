@@ -108,13 +108,15 @@ class DecodeColumnChunkOperator final : public Operator {
  * transfer size. A flow ends in exactly one sink; a transfer larger than a single output-writer
  * buffer spans multiple buffers, which the hardware fills in enqueue order.
  *
- * A sink covers *both* of its channel's logical output streams. The values buffers go to
+ * A sink covers *all* of its channel's logical output streams. The values buffers go to
  * values_stream(channel); a string chunk additionally has one heap buffer, which goes to
- * heap_stream(channel). apply() enqueues each to the right stream, in order.
+ * heap_stream(channel), and a dictionary encoded string chunk one dictionary buffer, which goes to
+ * dict_stream(channel). apply() enqueues each to the right stream, in order.
  *
  * The heap is limited to a single buffer on purpose: the decoder walks it linearly from the base
  * address it was configured with, so a heap spilling into a second (non-adjacent) allocation would
- * produce records pointing outside it.
+ * produce records pointing outside it. The dictionary is one buffer so that the indices address a
+ * single contiguous string_t array.
  */
 class LocalSinkOperator final : public Operator {
   public:
@@ -122,20 +124,27 @@ class LocalSinkOperator final : public Operator {
     // in write order (each capacity must be a multiple of BYTES_PER_FPGA_TRANSFER). `heap_buffer` is
     // the string heap destination for a GERMAN_STR_T flow, and must be null otherwise -- enqueueing
     // one for a non-string flow leaves it forever unwritten in the hardware FIFO, which desynchronises
-    // every later heap transfer on that stream. `tag` identifies this flow's output to the consumer,
-    // since a QuerySplinter's flows can return in any order.
+    // every later heap transfer on that stream. `dict_buffer` is the dictionary destination of a
+    // dictionary encoded GERMAN_STR_T flow, null otherwise, for the same reason. `tag` identifies
+    // this flow's output to the consumer, since a QuerySplinter's flows can return in any order.
     explicit LocalSinkOperator(std::vector<std::shared_ptr<libstf::Buffer>> buffers, size_t tag = 0,
-                      std::shared_ptr<libstf::Buffer> heap_buffer = nullptr)
-        : tag_(tag), buffers_(std::move(buffers)), heap_buffer_(std::move(heap_buffer)) {
+                               std::shared_ptr<libstf::Buffer> heap_buffer = nullptr,
+                               std::shared_ptr<libstf::Buffer> dict_buffer = nullptr)
+        : tag_(tag), buffers_(std::move(buffers)), heap_buffer_(std::move(heap_buffer)),
+          dict_buffer_(std::move(dict_buffer)) {
         if (buffers_.empty()) {
             throw std::runtime_error("LocalSinkOperator requires at least one buffer");
+        }
+        if (dict_buffer_ && !heap_buffer_) {
+            throw std::runtime_error("LocalSinkOperator: a dictionary buffer requires a heap buffer");
         }
     }
 
     explicit LocalSinkOperator(std::shared_ptr<libstf::Buffer> buffer, size_t tag = 0,
-                               std::shared_ptr<libstf::Buffer> heap_buffer = nullptr)
+                               std::shared_ptr<libstf::Buffer> heap_buffer = nullptr,
+                               std::shared_ptr<libstf::Buffer> dict_buffer = nullptr)
         : LocalSinkOperator(std::vector<std::shared_ptr<libstf::Buffer>>{std::move(buffer)}, tag,
-                            std::move(heap_buffer)) {}
+                            std::move(heap_buffer), std::move(dict_buffer)) {}
 
     void apply(libstf::stream_t stream, OasisContext &ctx) override;
     void print(std::ostream &os) const override;
@@ -145,12 +154,15 @@ class LocalSinkOperator final : public Operator {
     }
     [[nodiscard]] const std::shared_ptr<libstf::Buffer> &heap_buffer() const { return heap_buffer_; }
     [[nodiscard]] bool   has_heap() const { return heap_buffer_ != nullptr; }
+    [[nodiscard]] const std::shared_ptr<libstf::Buffer> &dict_buffer() const { return dict_buffer_; }
+    [[nodiscard]] bool   has_dict() const { return dict_buffer_ != nullptr; }
     [[nodiscard]] size_t tag() const { return tag_; }
 
   private:
     size_t                                       tag_;
     std::vector<std::shared_ptr<libstf::Buffer>> buffers_;
     std::shared_ptr<libstf::Buffer>              heap_buffer_;
+    std::shared_ptr<libstf::Buffer>              dict_buffer_;
 };
 
 } // namespace oasis

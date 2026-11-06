@@ -146,6 +146,7 @@ SplinterResultHandle Scheduler::submit(QuerySplinter splinter) {
         assert(sink != nullptr && "flow has no sink");
         pending.num_buffers[static_cast<size_t>(OutputSlot::VALUES)] = sink->buffers().size();
         pending.num_buffers[static_cast<size_t>(OutputSlot::HEAP)]   = sink->has_heap() ? 1 : 0;
+        pending.num_buffers[static_cast<size_t>(OutputSlot::DICT)]   = sink->has_dict() ? 1 : 0;
         const auto &candidates = streams_by_capability_[capability_index(pending.capability)];
         if (candidates.empty()) {
             throw std::runtime_error(
@@ -335,7 +336,8 @@ void Scheduler::dispatch_to(libstf::stream_t channel, Pending &pending) {
         }
         assert(sink != nullptr && "flow has no sink");
 
-        // The flow concludes when every buffer it enqueues -- values *and* heap -- has completed.
+        // The flow concludes when every buffer it enqueues -- values, heap and dictionary -- has
+        // completed.
         // Set before anything is enqueued, so the count is already visible to an interrupt that
         // fires while the rest of this function is still running.
         in_flight->outstanding_buffers.store(pending.total_buffers(), std::memory_order_relaxed);
@@ -354,6 +356,11 @@ void Scheduler::dispatch_to(libstf::stream_t channel, Pending &pending) {
         if (sink->has_heap()) {
             ss.completions[static_cast<size_t>(OutputSlot::HEAP)].push_back(
                 PendingCompletion{sink->heap_buffer(), sink->tag(), OutputSlot::HEAP,
+                                  in_flight->completion, in_flight, true});
+        }
+        if (sink->has_dict()) {
+            ss.completions[static_cast<size_t>(OutputSlot::DICT)].push_back(
+                PendingCompletion{sink->dict_buffer(), sink->tag(), OutputSlot::DICT,
                                   in_flight->completion, in_flight, true});
         }
         libstf::Profiler::close_regions({profiler_prefix + "dispatch_to::setup"});
@@ -418,7 +425,7 @@ void Scheduler::handle_completion(libstf::stream_t stream, uint32_t bytes_writte
     assert(last == pc.last && "hardware `last` flag disagrees with the stream's final buffer");
 
     // A flow is done when every buffer it enqueued has completed, not when any one interrupt says
-    // `last`: a string flow writes on two logical streams that complete independently and in either
+    // `last`: a string flow writes on several logical streams that complete independently and in any
     // order, so neither stream's final interrupt is on its own the flow's.
     const bool flow_done =
         pc.in_flight->outstanding_buffers.fetch_sub(1, std::memory_order_acq_rel) == 1;

@@ -16,20 +16,23 @@ namespace {
 constexpr double BYTES_PER_HANDSHAKE = 64.0;
 constexpr double CLOCK_PERIOD_NS = 4.0;
 
+// The profiled streams of a decoder slot, in column order. "out" is the values stream, which carries
+// the dictionary indices of a dictionary encoded string chunk.
+constexpr const char *STREAM_NAMES[] = {"in", "out", "heap", "dict"};
+constexpr idx_t NUM_PROFILED_STREAMS = sizeof(STREAM_NAMES) / sizeof(STREAM_NAMES[0]);
+static_assert(NUM_PROFILED_STREAMS == parcore::COLUMN_CHUNK_DECODER_PROFILED_STREAMS,
+              "one column group per stream of parcore::DecoderProfile");
+
 // One materialized output row: the raw counters for a stream slot plus the derived throughput
-// numbers. Decoder slots have an input and an output profiler; the RDMA bypass slot has a single
-// profiler on its output stream, so its in-side columns are NULL. throughput is in GB/s (== bytes
-// per nanosecond).
+// numbers. Decoder slots have a profiler on their input and on each of their three outputs; the
+// RDMA bypass slot has a single profiler on its output stream, so its other columns are NULL.
+// throughput is in GB/s (== bytes per nanosecond).
 struct ProfileRow {
 	uint64_t stream;
-	bool has_in;
-
-	parcore::DecoderProfile profile;
-
-	double in_throughput_gbps;            // over the whole profiled window (includes idle cycles)
-	double in_throughput_excl_idle_gbps;  // excluding inter-stream idle cycles
-	double out_throughput_gbps;
-	double out_throughput_excl_idle_gbps;
+	parcore::StreamProfile profiles[NUM_PROFILED_STREAMS];
+	bool present[NUM_PROFILED_STREAMS];
+	double throughput_gbps[NUM_PROFILED_STREAMS];           // over the whole profiled window (incl. idle)
+	double throughput_excl_idle_gbps[NUM_PROFILED_STREAMS]; // excluding inter-stream idle cycles
 };
 
 // Bytes transported divided by the time spent over `cycles` clock cycles, in GB/s. Returns 0 when
@@ -43,43 +46,36 @@ double ThroughputGBps(uint64_t handshakes, uint64_t cycles) {
 	return bytes / time_ns;
 }
 
-ProfileRow MakeRow(uint64_t stream, const parcore::DecoderProfile &p) {
-	ProfileRow row;
-	row.stream = stream;
-	row.has_in = true;
-	row.profile = p;
-
+void SetStream(ProfileRow &row, idx_t s, const parcore::StreamProfile &p) {
+	row.profiles[s] = p;
+	row.present[s] = true;
 	// Overall: every cycle the profiler observed for this stream, including idle gaps between
 	// streams. Excluding-idle: the cycles the stream was actually running.
-	uint64_t in_total = p.in.handshakes_cycles + p.in.starved_cycles + p.in.stalled_cycles + p.in.idle_cycles;
-	uint64_t in_busy = p.in.handshakes_cycles + p.in.starved_cycles + p.in.stalled_cycles;
-	uint64_t out_total =
-	    p.out.handshakes_cycles + p.out.starved_cycles + p.out.stalled_cycles + p.out.idle_cycles;
-	uint64_t out_busy = p.out.handshakes_cycles + p.out.starved_cycles + p.out.stalled_cycles;
+	uint64_t busy = p.handshakes_cycles + p.starved_cycles + p.stalled_cycles;
+	row.throughput_gbps[s] = ThroughputGBps(p.handshakes_cycles, busy + p.idle_cycles);
+	row.throughput_excl_idle_gbps[s] = ThroughputGBps(p.handshakes_cycles, busy);
+}
 
-	row.in_throughput_gbps = ThroughputGBps(p.in.handshakes_cycles, in_total);
-	row.in_throughput_excl_idle_gbps = ThroughputGBps(p.in.handshakes_cycles, in_busy);
-	row.out_throughput_gbps = ThroughputGBps(p.out.handshakes_cycles, out_total);
-	row.out_throughput_excl_idle_gbps = ThroughputGBps(p.out.handshakes_cycles, out_busy);
+ProfileRow EmptyRow(uint64_t stream) {
+	ProfileRow row {};
+	row.stream = stream;
+	return row;
+}
+
+ProfileRow MakeRow(uint64_t stream, const parcore::DecoderProfile &p) {
+	ProfileRow row = EmptyRow(stream);
+	SetStream(row, 0, p.in);
+	SetStream(row, 1, p.out);
+	SetStream(row, 2, p.heap);
+	SetStream(row, 3, p.dict);
 	return row;
 }
 
 // The bypass stream has one StreamProfiler on its output (the RDMA-read data feeding the output
 // writer), so only the out-side of the row is populated.
 ProfileRow MakeBypassRow(uint64_t stream, const parcore::StreamProfile &p) {
-	ProfileRow row;
-	row.stream = stream;
-	row.has_in = false;
-	row.profile.in = {};
-	row.profile.out = p;
-
-	uint64_t out_total = p.handshakes_cycles + p.starved_cycles + p.stalled_cycles + p.idle_cycles;
-	uint64_t out_busy = p.handshakes_cycles + p.starved_cycles + p.stalled_cycles;
-
-	row.in_throughput_gbps = 0.0;
-	row.in_throughput_excl_idle_gbps = 0.0;
-	row.out_throughput_gbps = ThroughputGBps(p.handshakes_cycles, out_total);
-	row.out_throughput_excl_idle_gbps = ThroughputGBps(p.handshakes_cycles, out_busy);
+	ProfileRow row = EmptyRow(stream);
+	SetStream(row, 1, p);
 	return row;
 }
 
@@ -107,22 +103,20 @@ void DefineColumns(vector<Identifier> &names, vector<LogicalType> &types) {
 
 	add("stream", LogicalType::UBIGINT);
 
-	add("in_handshakes_cycles", LogicalType::UBIGINT);
-	add("in_starved_cycles", LogicalType::UBIGINT);
-	add("in_stalled_cycles", LogicalType::UBIGINT);
-	add("in_idle_cycles", LogicalType::UBIGINT);
-	add("in_last_handshakes", LogicalType::UBIGINT);
+	for (auto name : STREAM_NAMES) {
+		string prefix(name);
+		add((prefix + "_handshakes_cycles").c_str(), LogicalType::UBIGINT);
+		add((prefix + "_starved_cycles").c_str(), LogicalType::UBIGINT);
+		add((prefix + "_stalled_cycles").c_str(), LogicalType::UBIGINT);
+		add((prefix + "_idle_cycles").c_str(), LogicalType::UBIGINT);
+		add((prefix + "_last_handshakes").c_str(), LogicalType::UBIGINT);
+	}
 
-	add("out_handshakes_cycles", LogicalType::UBIGINT);
-	add("out_starved_cycles", LogicalType::UBIGINT);
-	add("out_stalled_cycles", LogicalType::UBIGINT);
-	add("out_idle_cycles", LogicalType::UBIGINT);
-	add("out_last_handshakes", LogicalType::UBIGINT);
-
-	add("in_throughput_gbps", LogicalType::DOUBLE);
-	add("in_throughput_excl_idle_gbps", LogicalType::DOUBLE);
-	add("out_throughput_gbps", LogicalType::DOUBLE);
-	add("out_throughput_excl_idle_gbps", LogicalType::DOUBLE);
+	for (auto name : STREAM_NAMES) {
+		string prefix(name);
+		add((prefix + "_throughput_gbps").c_str(), LogicalType::DOUBLE);
+		add((prefix + "_throughput_excl_idle_gbps").c_str(), LogicalType::DOUBLE);
+	}
 }
 
 unique_ptr<FunctionData> OasisProfileBind(ClientContext &context, TableFunctionBindInput &input,
@@ -172,33 +166,23 @@ void OasisProfileFunction(ClientContext &context, TableFunctionInput &data_p, Da
 
 	for (idx_t i = 0; i < count; i++) {
 		const auto &row = gstate.rows[gstate.offset + i];
-		const auto &p = row.profile;
 
 		idx_t col = 0;
-		// The bypass row has no input-side profiler; its in_* columns are NULL.
-		auto in_u64 = [&](uint64_t v) {
-			return row.has_in ? Value::UBIGINT(v) : Value(LogicalType::UBIGINT);
-		};
-		auto in_f64 = [&](double v) { return row.has_in ? Value::DOUBLE(v) : Value(LogicalType::DOUBLE); };
-
 		output.data[col++].SetValue(i, Value::UBIGINT(row.stream));
 
-		output.data[col++].SetValue(i, in_u64(p.in.handshakes_cycles));
-		output.data[col++].SetValue(i, in_u64(p.in.starved_cycles));
-		output.data[col++].SetValue(i, in_u64(p.in.stalled_cycles));
-		output.data[col++].SetValue(i, in_u64(p.in.idle_cycles));
-		output.data[col++].SetValue(i, in_u64(p.in.last_handshakes));
-
-		output.data[col++].SetValue(i, Value::UBIGINT(p.out.handshakes_cycles));
-		output.data[col++].SetValue(i, Value::UBIGINT(p.out.starved_cycles));
-		output.data[col++].SetValue(i, Value::UBIGINT(p.out.stalled_cycles));
-		output.data[col++].SetValue(i, Value::UBIGINT(p.out.idle_cycles));
-		output.data[col++].SetValue(i, Value::UBIGINT(p.out.last_handshakes));
-
-		output.data[col++].SetValue(i, in_f64(row.in_throughput_gbps));
-		output.data[col++].SetValue(i, in_f64(row.in_throughput_excl_idle_gbps));
-		output.data[col++].SetValue(i, Value::DOUBLE(row.out_throughput_gbps));
-		output.data[col++].SetValue(i, Value::DOUBLE(row.out_throughput_excl_idle_gbps));
+		// Streams without a profiler (all but `out` of the bypass row) are NULL.
+		for (idx_t s = 0; s < NUM_PROFILED_STREAMS; s++) {
+			const auto &p = row.profiles[s];
+			for (uint64_t v : {p.handshakes_cycles, p.starved_cycles, p.stalled_cycles, p.idle_cycles,
+			                   p.last_handshakes}) {
+				output.data[col++].SetValue(i, row.present[s] ? Value::UBIGINT(v) : Value(LogicalType::UBIGINT));
+			}
+		}
+		for (idx_t s = 0; s < NUM_PROFILED_STREAMS; s++) {
+			for (double v : {row.throughput_gbps[s], row.throughput_excl_idle_gbps[s]}) {
+				output.data[col++].SetValue(i, row.present[s] ? Value::DOUBLE(v) : Value(LogicalType::DOUBLE));
+			}
+		}
 	}
 
 	gstate.offset += count;

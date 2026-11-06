@@ -100,7 +100,7 @@ class Scheduler {
     // One in-flight flow on a channel. It owns the flow's operators (including the sink's output
     // buffers) until reaped, plus a shared pointer to the splinter's completion record.
     //
-    // `outstanding_buffers` is what concludes the flow. A string flow enqueues buffers on both of
+    // `outstanding_buffers` is what concludes the flow. A string flow enqueues buffers on several of
     // its channel's logical streams, which complete independently and in either order, so no single
     // interrupt can be "the last one" -- the flow is done when this reaches zero. It is written by
     // the dispatcher before the flow is enqueued to the hardware and decremented by the interrupt
@@ -137,8 +137,11 @@ class Scheduler {
         std::array<size_t, OUTPUT_STREAMS_PER_CHANNEL> num_buffers{};
 
         [[nodiscard]] size_t total_buffers() const {
-            return num_buffers[static_cast<size_t>(OutputSlot::VALUES)] +
-                   num_buffers[static_cast<size_t>(OutputSlot::HEAP)];
+            size_t total = 0;
+            for (size_t n : num_buffers) {
+                total += n;
+            }
+            return total;
         }
     };
 
@@ -152,8 +155,8 @@ class Scheduler {
     // must never take dispatch_mutex_ while the dispatcher holds dispatch_mutex_ and is waiting for
     // the channel mutex. `in_flight`/`done` are guarded by the channel mutex.
     //
-    // `completions` is per logical stream: the two streams complete independently and in either
-    // order, so one shared FIFO would mismatch a heap interrupt against a values buffer.
+    // `completions` is per logical stream: the streams complete independently and in any order,
+    // so one shared FIFO would mismatch a heap interrupt against a values buffer.
     struct StreamState {
         std::mutex          mutex;
         std::list<InFlight> in_flight;

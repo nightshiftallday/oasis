@@ -13,16 +13,18 @@ constexpr const uint64_t OASIS_SYSTEM_ID = 0x0A515;
 
 /**
  * Logical output streams per physical channel. The hardware's PairedOutputWriter puts a decoder's
- * values and its string heap on the same Coyote channel but gives them separate MemConfig slots and
- * separate interrupt stream ids, numbered 2*channel and 2*channel + 1. Everything the host
- * addresses per output buffer -- MemConfig::enqueue_buffer, the interrupt's stream id -- uses that
- * logical number; everything that addresses a decoder -- ColumnChunkDecoderConfig, ReadReqConfig --
- * uses the channel.
+ * values, its string heap and its string dictionary on the same Coyote channel but gives them
+ * separate MemConfig slots and separate interrupt stream ids, numbered 3*channel, 3*channel + 1 and
+ * 3*channel + 2. Everything the host addresses per output buffer -- MemConfig::enqueue_buffer, the
+ * interrupt's stream id -- uses that logical number; everything that addresses a decoder --
+ * ColumnChunkDecoderConfig, ReadReqConfig -- uses the channel.
  */
-constexpr size_t OUTPUT_STREAMS_PER_CHANNEL = 2;
+constexpr size_t OUTPUT_STREAMS_PER_CHANNEL = 3;
 
-// Which of a channel's two logical output streams a buffer belongs to.
-enum class OutputSlot : size_t { VALUES = 0, HEAP = 1 };
+// Which of a channel's logical output streams a buffer belongs to. DICT only carries data for a
+// dictionary encoded string chunk: the german_str_t records of its dictionary page, while VALUES
+// then holds one uint32_t dictionary index per row (a DuckDB dictionary vector).
+enum class OutputSlot : size_t { VALUES = 0, HEAP = 1, DICT = 2 };
 
 constexpr libstf::stream_t logical_stream(libstf::stream_t channel, OutputSlot slot) {
     return static_cast<libstf::stream_t>(channel * OUTPUT_STREAMS_PER_CHANNEL +
@@ -35,6 +37,10 @@ constexpr libstf::stream_t values_stream(libstf::stream_t channel) {
 
 constexpr libstf::stream_t heap_stream(libstf::stream_t channel) {
     return logical_stream(channel, OutputSlot::HEAP);
+}
+
+constexpr libstf::stream_t dict_stream(libstf::stream_t channel) {
+    return logical_stream(channel, OutputSlot::DICT);
 }
 
 constexpr libstf::stream_t stream_channel(libstf::stream_t logical) {
