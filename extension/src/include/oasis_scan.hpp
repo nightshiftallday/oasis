@@ -7,6 +7,7 @@
 #include "oasis/oasis_context.hpp"
 #include "oasis/splinter_result.hpp"
 #include "oasis_context_cache_entry.hpp"
+#include "parcore/dictionary_vector.hpp"
 #include "parcore/metadata/metadata.hpp"
 #include "parquet_reader.hpp"
 
@@ -111,11 +112,26 @@ struct OasisScanGlobalState : public GlobalTableFunctionState {
 	oasis::OasisContext *ctx = nullptr;
 
 	vector<ProjectedColumn> projected_columns;
+	// Whether any column chunk is decoded on the CPU: CPU-path columns, or string chunks that are
+	// not offloaded.
 	bool has_cpu_columns = false;
 
 	// Whether chunks of narrowable columns are decoded to INT32 when their statistics fit
 	// (oasis_narrow_transfer).
 	bool narrow_transfer = false;
+
+	// Whether dictionary encoded chunks of hardware string columns are emitted as DuckDB dictionary
+	// vectors when parcore::can_defer_dict_decoding accepts them (oasis_dictionary_vectors).
+	bool dictionary_vectors = false;
+
+	// Per row group and projection index: whether a column on the german-string hardware path has
+	// this group's chunk decoded on the CPU instead, so that only a share of the string chunks is
+	// offloaded (oasis_offload_dict_string_ratio / oasis_offload_plain_string_ratio). Empty when
+	// every such chunk is offloaded. Decided once per scan, as workers claim groups in any order.
+	std::vector<std::vector<bool>> string_chunk_on_cpu;
+	// How many hardware-path string chunks are offloaded, for the operator metrics; empty without
+	// hardware-path string columns.
+	std::string offload_summary;
 
 	// filter_prune support. When the plan consumes fewer columns than the scan reads (some are
 	// filter-only), can_prune is set, projection_ids holds the indices (into projected_columns)
@@ -206,6 +222,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		// Per projection index: whether the column's chunk of this group is transferred as INT32.
 		std::vector<bool> narrowed;
 
+		// Per projection index: whether the column's chunk of this group is decoded on the CPU
+		// (always for CPU-path columns, for some groups of hardware string columns).
+		std::vector<bool> on_cpu;
+
 		// CPU-path columns of this group: Fetched over RDMA as raw bypass flows: cpu_slot[k]
         // is the projection index, cpu_chunks[k] the chunk.
 		std::vector<size_t> cpu_slot;
@@ -219,10 +239,10 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 		// String heap per projection index; null for every column that is not a german-string
 		// column. A string column's records point into it, so it must outlive the values buffer.
 		std::vector<std::shared_ptr<libstf::Buffer>> heap_buffers;
-		// String dictionary per projection index; null unless the column's chunk of this group is
-		// dictionary encoded. Then hw_buffers holds one uint32_t index per row into it, and the
-		// column is emitted as a DuckDB dictionary vector.
-		std::vector<std::shared_ptr<libstf::Buffer>> dict_buffers;
+		// Per projection index: whether the column's chunk of this group is decoded with
+		// defer_dict_decoding. Its hw_buffers entry then holds the dictionary followed by the
+		// indices (parcore::DeferredDictLayout), and the column is emitted as dictionary vectors.
+		std::vector<bool> deferred;
 		std::vector<std::vector<std::shared_ptr<libstf::Buffer>>> cpu_buffers;
 	};
 
@@ -233,14 +253,20 @@ struct OasisScanLocalState : public LocalTableFunctionState {
 	std::vector<std::shared_ptr<libstf::Buffer>> current_buffers;
 	std::vector<std::shared_ptr<libstf::Buffer>> current_heap_buffers;
 
-	// Per projection index: the current group's dictionary for a dictionary encoded string column,
-	// null otherwise. One entry per column chunk, shared by all of the group's vectors of that column
-	// so that operators can cache per dictionary id. Its child vector wraps the dictionary buffer and
-	// pins it and the string heap.
+	// Per projection index: the current group's dictionary for a column whose chunk was decoded with
+	// defer_dict_decoding, null otherwise. One entry per column chunk, shared by all of the group's
+	// vectors of that column so that operators can cache per dictionary id. Its child vector is the
+	// german_str_t records at the start of the values buffer (zero-copy), and it pins that buffer --
+	// which also holds the indices -- and the string heap the records point into.
 	std::vector<buffer_ptr<DictionaryEntry>> current_dictionaries;
+	// The layout of those columns' values buffers, where the indices start and how wide they are.
+	std::vector<parcore::DeferredDictLayout> current_dict_layouts;
 
 	// The current group's narrowed flags (see PendingGroup).
 	std::vector<bool> current_narrowed;
+
+	// The current group's on_cpu flags (see PendingGroup), consumed by DecodeAndFilterSlice.
+	std::vector<bool> current_on_cpu;
 
 	// The current group's needs_row_filter mask (see PendingGroup), consumed by DecodeAndFilterSlice.
 	std::vector<bool> current_needs_row_filter;

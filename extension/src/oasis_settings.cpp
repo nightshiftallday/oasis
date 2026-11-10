@@ -39,4 +39,14 @@ void SetSchedulerQueueDepth(ClientContext &context, SetScope, Value &parameter) 
 	GetOrCreateOasisContext(context).scheduler().set_pipeline_depth(static_cast<size_t>(depth));
 }
 
+void ValidateOffloadRatio(ClientContext &, SetScope, Value &parameter) {
+	if (parameter.IsNull()) {
+		return;
+	}
+	auto ratio = parameter.GetValue<double>();
+	if (!(ratio >= 0.0 && ratio <= 1.0)) {
+		throw InvalidInputException("read_oasis string offload ratios must be between 0 and 1 (got %f)", ratio);
+	}
+}
+
 } // namespace duckdb

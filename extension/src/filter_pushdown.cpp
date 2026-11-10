@@ -196,7 +196,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 			// Filter keys are output/projection indices, aligned with projected_columns and
 			// scan_chunk.data.
 			const auto &col = gstate.projected_columns[scan_filter.filter_idx];
-			if (!col.is_cpu || !filter_active(k)) {
+			if (!lstate.current_on_cpu[scan_filter.filter_idx] || !filter_active(k)) {
 				continue;
 			}
 			auto &reader = lstate.scan_state->GetColumnReader(col.column_id);
@@ -223,7 +223,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 		}
 	}
 
-	// Phase 2: hardware-column filters, on the already-decoded flat vectors.
+	// Phase 2: hardware-column filters, on the already-decoded vectors (flat or dictionary).
 	{
 		ScopedTimer timer(lstate.filter_time_ns);
 		for (size_t k = 0; k < lstate.scan_filters.size(); k++) {
@@ -231,8 +231,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 				break;
 			}
 			auto &scan_filter = lstate.scan_filters[k];
-			const auto &col = gstate.projected_columns[scan_filter.filter_idx];
-			if (col.is_cpu || !filter_active(k)) {
+			if (lstate.current_on_cpu[scan_filter.filter_idx] || !filter_active(k)) {
 				continue;
 			}
 			auto &vec = scan_chunk.data[scan_filter.filter_idx];
@@ -248,7 +247,7 @@ idx_t DecodeAndFilterSlice(OasisScanGlobalState &gstate, OasisScanLocalState &ls
 		ScopedTimer timer(lstate.string_decode_time_ns);
 		for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 			const auto &col = gstate.projected_columns[i];
-			if (!col.is_cpu || lstate.cpu_column_read[i]) {
+			if (!lstate.current_on_cpu[i] || lstate.cpu_column_read[i]) {
 				continue;
 			}
 			auto &reader = lstate.scan_state->GetColumnReader(col.column_id);

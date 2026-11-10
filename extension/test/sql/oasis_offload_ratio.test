@@ -1,0 +1,94 @@
+# name: test/sql/oasis_offload_ratio.test
+# description: oasis_offload_dict_string_ratio / oasis_offload_plain_string_ratio pick which string chunks read_oasis decodes on the FPGA
+# group: [oasis]
+
+require oasis
+
+require parquet
+
+# Four row groups, each with a dictionary encoded chunk of d (100 distinct values) and a PLAIN chunk
+# of p (all values distinct). Chunks that are not offloaded are decoded by DuckDB's ColumnReader,
+# so the results must not depend on the ratios.
+statement ok
+COPY (SELECT range AS i,
+             'k' || (range % 100)::VARCHAR || repeat('x', range % 100 % 30) AS d,
+             'u' || range::VARCHAR || repeat('y', range % 20) AS p
+      FROM range(8192))
+TO '__TEST_DIR__/offload.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 2048);
+
+statement ok
+CALL enable_logging(level = 'debug');
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+statement error
+SET oasis_offload_dict_string_ratio = -0.1;
+----
+must be between 0 and 1
+
+statement error
+SET oasis_offload_plain_string_ratio = 1.5;
+----
+must be between 0 and 1
+
+query II
+SELECT current_setting('oasis_offload_dict_string_ratio'), current_setting('oasis_offload_plain_string_ratio');
+----
+1.0	1.0
+
+# ---------------------------------------------------------------------------
+# Offloaded chunk counts and results, per pair of ratios. With ratio r, floor(4 * r) of a column's
+# four chunks of an encoding are offloaded, spread evenly over the row groups.
+# ---------------------------------------------------------------------------
+
+foreach ratios 1.0,1.0,4,4 0.0,0.0,0,0 0.5,0.5,2,2 0.25,0.75,1,3 1.0,0.0,4,0 0.0,1.0,0,4
+
+statement ok
+SET oasis_offload_dict_string_ratio = split_part('${ratios}', ',', 1)::DOUBLE;
+
+statement ok
+SET oasis_offload_plain_string_ratio = split_part('${ratios}', ',', 2)::DOUBLE;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/offload.parquet') o
+JOIN read_parquet('__TEST_DIR__/offload.parquet') p USING (i)
+WHERE o.d IS DISTINCT FROM p.d OR o.p IS DISTINCT FROM p.p;
+----
+0
+
+query I
+SELECT message = 'read_oasis offloads string chunks: dictionary ' || split_part('${ratios}', ',', 3) || '/4, plain '
+                 || split_part('${ratios}', ',', 4) || '/4'
+FROM duckdb_logs WHERE message LIKE 'read_oasis offloads string chunks:%' LIMIT 1;
+----
+true
+
+# A pushed-down filter on each string column, decoded in hardware in some groups and on the CPU in others
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('__TEST_DIR__/offload.parquet') WHERE d = 'k7xxxxxxx' OR p LIKE 'u12%'
+                              EXCEPT ALL FROM read_parquet('__TEST_DIR__/offload.parquet') WHERE d = 'k7xxxxxxx' OR p LIKE 'u12%'))
+     + (SELECT count(*) FROM (FROM read_parquet('__TEST_DIR__/offload.parquet') WHERE d = 'k7xxxxxxx' OR p LIKE 'u12%'
+                              EXCEPT ALL FROM read_oasis('__TEST_DIR__/offload.parquet') WHERE d = 'k7xxxxxxx' OR p LIKE 'u12%'));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT d FROM read_oasis('__TEST_DIR__/offload.parquet') WHERE p LIKE 'u3%'
+                              EXCEPT ALL SELECT d FROM read_parquet('__TEST_DIR__/offload.parquet') WHERE p LIKE 'u3%'))
+     + (SELECT count(*) FROM (SELECT d FROM read_parquet('__TEST_DIR__/offload.parquet') WHERE p LIKE 'u3%'
+                              EXCEPT ALL SELECT d FROM read_oasis('__TEST_DIR__/offload.parquet') WHERE p LIKE 'u3%'));
+----
+0
+
+endloop
+
+statement ok
+RESET oasis_offload_dict_string_ratio;
+
+statement ok
+RESET oasis_offload_plain_string_ratio;

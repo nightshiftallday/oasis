@@ -68,6 +68,26 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "zero-copy. Set to false to route every string column through DuckDB's own ColumnReader "
 	    "instead, which is the fallback ineligible columns already take.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption(
+	    "oasis_dictionary_vectors",
+	    "Emit dictionary encoded string column chunks decoded on the FPGA as DuckDB dictionary vectors: "
+	    "the FPGA transfers the dictionary once plus a 1, 2 or 4 byte index per row instead of a "
+	    "german string per row. Only chunks without NULLs whose footer lists a dictionary encoding "
+	    "qualify, which assumes files written by DuckDB (no PLAIN fallback within a chunk).",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption(
+	    "oasis_offload_dict_string_ratio",
+	    "Share of the dictionary encoded column chunks of hardware-eligible string columns (VARCHAR/BLOB) "
+	    "that read_oasis decodes on the FPGA, between 0 and 1; DuckDB's ColumnReader decodes the rest. The "
+	    "offloaded chunks are spread evenly over the row groups of each column. The operator profile "
+	    "reports the resulting counts as 'Offloaded String Chunks'.",
+	    LogicalType::DOUBLE, Value::DOUBLE(1.0), ValidateOffloadRatio);
+	config.AddExtensionOption(
+	    "oasis_offload_plain_string_ratio",
+	    "Share of the column chunks of hardware-eligible string columns (VARCHAR/BLOB) that are not "
+	    "dictionary encoded which read_oasis decodes on the FPGA, between 0 and 1; DuckDB's ColumnReader "
+	    "decodes the rest. See oasis_offload_dict_string_ratio.",
+	    LogicalType::DOUBLE, Value::DOUBLE(1.0), ValidateOffloadRatio);
 
 	// Oasis scan table function
 	RegisterOasisScanFunction(loader);

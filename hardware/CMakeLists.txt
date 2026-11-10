@@ -8,9 +8,9 @@ find_package(CoyoteHW REQUIRED)
 
 # Number of ColumnChunkDecoders. The number of streams is equal to this in local mode. If RDMA is 
 # enabled, there will be an additional RDMA bypass stream for the RDMAFileSystem.
-# Every stream carries 3 logical output streams (values, string heap, string dictionary) and the
-# notify value has a 3-bit stream id, so at most 2 streams fit: N_DECODERS <= 1 with RDMA, <= 2
-# without (vfpga_top.svh asserts this).
+# Every decoder writes 2 output ports (values, string heap), the RDMA bypass 1, and the notify
+# value has a 3-bit port id, so at most 8 ports fit: N_DECODERS <= 3 with RDMA, <= 4 without
+# (vfpga_top.svh asserts this).
 set(N_DECODERS 1 CACHE STRING "Number of ColumnChunkDecoders (default=1)")
 
 # Include Coyote's RDMA stack during synthesis (disable with -DENABLE_RDMA=OFF)

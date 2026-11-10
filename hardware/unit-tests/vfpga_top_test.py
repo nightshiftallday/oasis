@@ -61,20 +61,17 @@ READ_REQ_REGS_PER_STREAM = 3
 # addresses to this.
 DATABEAT_SIZE = 64
 
-# PairedOutputWriter: values on 3I, string heap on 3I+1, string dictionary on 3I+2.
-OUTPUTS_PER_CHANNEL = 3
+# OutputWriter ports: decoder I's values on port 2I, its string heap on port 2I+1. The RDMA bypass
+# stream carries a single port after the decoders' ports.
+PORTS_PER_DECODER = 2
 
 
 def values_stream(decoder: int) -> int:
-    return OUTPUTS_PER_CHANNEL * decoder
+    return PORTS_PER_DECODER * decoder
 
 
 def heap_stream(decoder: int) -> int:
-    return OUTPUTS_PER_CHANNEL * decoder + 1
-
-
-def dict_stream(decoder: int) -> int:
-    return OUTPUTS_PER_CHANNEL * decoder + 2
+    return PORTS_PER_DECODER * decoder + 1
 
 
 def _register_value(value: int) -> bytearray:
@@ -240,7 +237,8 @@ class VFPGATopTestCase(OutputWriterTestCase):
                 compression = Compression.SNAPPY if chunk.compression else Compression.RAW
                 config.enqueue_column_chunk(
                     decoder, compression, chunk.num_values, chunk.data_type, chunk.is_required,
-                    chunk.logical_type if not chunk.is_string else None, chunk.heap_addr
+                    chunk.logical_type if not chunk.is_string else None,
+                    string_heap_addr=chunk.heap_addr,
                 )
 
                 self._enqueue_read(

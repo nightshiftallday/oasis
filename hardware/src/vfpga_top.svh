@@ -29,16 +29,6 @@ end
 localparam NUM_STREAMS        = N_STRM_AXI;
 localparam DATABEAT_SIZE      = AXI_DATA_BITS / 8;
 
-// Each physical channel carries three logical output streams (PairedOutputWriter): values on
-// 3I, string heap on 3I+1, string dictionary on 3I+2. That indexing is also the mem_config slot
-// and the interrupt stream id, so software addresses output buffers by the same number.
-localparam OUTPUTS_PER_CHANNEL = 3;
-localparam NUM_OUTPUT_STREAMS  = OUTPUTS_PER_CHANNEL * NUM_STREAMS;
-
-// MemConfig write side needs NUM_OUTPUT_STREAMS+1 regs, read side needs 4
-// (ID, num_streams, max_enqueued, empty_stream_consumes_buffer).
-localparam MEM_CONFIG_NUM_REGS = (NUM_OUTPUT_STREAMS + 1 > 4) ? NUM_OUTPUT_STREAMS + 1 : 4;
-
 localparam NUM_CONFIGS   = 3;
 `ifdef EN_RDMA
 localparam NUM_DECODERS  = NUM_STREAMS - 1;
@@ -46,11 +36,33 @@ localparam NUM_DECODERS  = NUM_STREAMS - 1;
 localparam NUM_DECODERS  = NUM_STREAMS;
 `endif
 
-// StreamWriter encodes the logical stream id in irq_not_t.value[2:0], so 8 is the hard
-// ceiling and only 8 / 3 = 2 channels fit: one decoder plus the RDMA bypass channel, or two
-// decoders without RDMA. Fail here rather than deep inside PairedOutputWriter's own
-// ASSERT_ELAB, where the number no longer looks like the decoder count.
-`ASSERT_ELAB(NUM_OUTPUT_STREAMS <= 8)
+// The OutputWriter writes NUM_PORTS ports over the NUM_STREAMS Coyote streams. Each decoder's
+// stream carries two ports, its values on port 2I and its string heap on port 2I+1; the RDMA
+// bypass stream carries one, port 2 * NUM_DECODERS. The port is also the mem_config slot and the
+// interrupt's stream id, so software addresses output buffers by the same number.
+localparam int PORTS_PER_DECODER = 2;
+`ifdef EN_RDMA
+localparam int BYPASS_PORT = PORTS_PER_DECODER * NUM_DECODERS;
+localparam int NUM_PORTS   = BYPASS_PORT + 1;
+`else
+localparam int NUM_PORTS   = PORTS_PER_DECODER * NUM_DECODERS;
+`endif
+
+function automatic logic [0:NUM_STREAMS - 1][31:0] ports_per_stream();
+    for (int s = 0; s < NUM_STREAMS; s++) begin
+        ports_per_stream[s] = s < NUM_DECODERS ? PORTS_PER_DECODER : 1;
+    end
+endfunction
+localparam logic [0:NUM_STREAMS - 1][31:0] PORTS_PER_STREAM = ports_per_stream();
+
+// The interrupt carries the port in 3 bits, so at most 8 ports: 3 decoders plus the RDMA bypass,
+// or 4 decoders without RDMA. Fail here rather than deep inside the OutputWriter, where the
+// number no longer looks like the decoder count.
+`ASSERT_ELAB(NUM_PORTS <= 8)
+
+// MemConfig write side needs NUM_PORTS+1 regs, read side needs 4
+// (ID, num_streams, max_enqueued, empty_stream_consumes_buffer).
+localparam MEM_CONFIG_NUM_REGS = (NUM_PORTS + 1 > 4) ? NUM_PORTS + 1 : 4;
 
 // -- Fix clock and reset names --------------------------------------------------------------------
 logic clk;
@@ -62,10 +74,11 @@ assign rst_n = aresetn;
 // -- Configuration --------------------------------------------------------------------------------
 write_config_i                       write_configs[NUM_CONFIGS](.*);
 read_config_i                        read_configs [NUM_CONFIGS](.*);
-mem_config_i                         mem_conf[NUM_OUTPUT_STREAMS](.*);
+mem_config_i                         mem_conf[NUM_PORTS](.*);
 ready_valid_i #(read_req_t)          read_conf[NUM_STREAMS](.*);
 logic [PID_BITS-1:0]                 read_ctid[NUM_STREAMS];
 ready_valid_i #(column_chunk_conf_t) column_chunk_conf[NUM_DECODERS](.*);
+ready_valid_i #(vaddress_t)          heap_addrs[NUM_DECODERS](.*);
 decoder_profile_i                    decoder_profiles[NUM_DECODERS]();
 
 GlobalConfig #(
@@ -89,7 +102,7 @@ GlobalConfig #(
 // Software enqueues one buffer per output stream of a flow ahead of time, so the empty heap stream of
 // a string chunk without long strings has to consume its buffer as well.
 MemConfig #(
-    .NUM_STREAMS(NUM_OUTPUT_STREAMS),
+    .NUM_STREAMS(NUM_PORTS),
     .EMPTY_STREAM_CONSUMES_BUFFER(1)
 ) inst_mem_config (
     .clk(clk),
@@ -101,7 +114,8 @@ MemConfig #(
     .out(mem_conf)
 );
 
-ColumnChunkDecoderConfig #(
+// String decoders take a string chunk's heap base address through their own register
+StringColumnChunkDecoderConfig #(
     .NUM_DECODERS(NUM_DECODERS)
 ) inst_column_chunk_decoder_config (
     .clk(clk),
@@ -111,6 +125,7 @@ ColumnChunkDecoderConfig #(
     .read_config(read_configs[1]),
 
     .out(column_chunk_conf),
+    .heap_addrs(heap_addrs),
 
     .profile(decoder_profiles)
 );
@@ -143,14 +158,13 @@ MetaIntfArbiter #(
 );
 
 // -- Data path ------------------------------------------------------------------------------------
-AXI4S axi_produced[NUM_OUTPUT_STREAMS](.aclk(clk), .aresetn(rst_n));
-AXI4S axi_out     [NUM_OUTPUT_STREAMS](.aclk(clk), .aresetn(rst_n));
+AXI4S axi_produced[NUM_PORTS](.aclk(clk), .aresetn(rst_n));
+AXI4S axi_out     [NUM_PORTS](.aclk(clk), .aresetn(rst_n));
 for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
     AXI4S axi_in (.aclk(aclk), .aresetn(aresetn));
     ndata_i #(data8_t, DATABEAT_SIZE) decoder_in(.*);
     ndata_i #(data8_t, DATABEAT_SIZE) out(.*);
     ndata_i #(data8_t, DATABEAT_SIZE) heap_out(.*);
-    ndata_i #(data8_t, DATABEAT_SIZE) dict_out(.*);
 
     AXI4S axi_recv (.aclk(aclk), .aresetn(aresetn));
 
@@ -201,54 +215,44 @@ for (genvar I = 0; I < NUM_DECODERS; I++) begin : gen_decoders
     );
 `endif
 
-    ColumnChunkDecoder #(
+    StringColumnChunkDecoder #(
         .DATABEAT_SIZE(DATABEAT_SIZE)
     ) inst_column_chunk_decoder (
         .clk(clk),
         .rst_n(rst_n),
 
         .conf(column_chunk_conf[I]),
+        .heap_addr(heap_addrs[I]),
 
         .in(decoder_in),
         .out(out),
         .heap_out(heap_out),
-        .dict_out(dict_out),
 
         .profile(decoder_profiles[I])
     );
 
-    // Values -> logical stream 3I. For a dictionary encoded string chunk these are the 32-bit
-    // dictionary indices.
+    // Values -> port 2I. With defer_dict_decoding, a dictionary encoded chunk's dictionary
+    // followed by its 1, 2 or 4 byte indices.
     NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi (
         .clk(clk),
         .rst_n(rst_n),
 
         .in(out),
-        .out(axi_produced[OUTPUTS_PER_CHANNEL*I])
+        .out(axi_produced[PORTS_PER_DECODER*I])
     );
 
-    // String heap -> logical stream 3I+1. Idle for every chunk that is not a german string
-    // chunk, so nothing is written there and no interrupt is raised.
+    // String heap -> port 2I+1. Idle for every chunk that is not a german string chunk, so
+    // nothing is written there and no interrupt is raised.
     NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_heap (
         .clk(clk),
         .rst_n(rst_n),
 
         .in(heap_out),
-        .out(axi_produced[OUTPUTS_PER_CHANNEL*I+1])
-    );
-
-    // String dictionary -> logical stream 3I+2. Idle for every chunk that is not a dictionary
-    // encoded german string chunk.
-    NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_dict (
-        .clk(clk),
-        .rst_n(rst_n),
-
-        .in(dict_out),
-        .out(axi_produced[OUTPUTS_PER_CHANNEL*I+2])
+        .out(axi_produced[PORTS_PER_DECODER*I+1])
     );
 end : gen_decoders
 
-// -- RDMA bypass stream (last stream slot, no decoder) --------------------------------------------
+// -- RDMA bypass stream (last stream, no decoder, one port) ---------------------------------------
 `ifdef EN_RDMA
 localparam BYPASS_ID = NUM_STREAMS - 1;
 
@@ -279,16 +283,12 @@ NDataToAXI #(data8_t, DATABEAT_SIZE) inst_ndata_to_axi_bypass (
     .rst_n(rst_n),
 
     .in(bypass_ndata),
-    .out(axi_produced[OUTPUTS_PER_CHANNEL*BYPASS_ID])
+    .out(axi_produced[BYPASS_PORT])
 );
-
-// The bypass channel still has all logical streams; only its values stream has a producer.
-always_comb axi_produced[OUTPUTS_PER_CHANNEL*BYPASS_ID+1].tie_off_m();
-always_comb axi_produced[OUTPUTS_PER_CHANNEL*BYPASS_ID+2].tie_off_m();
 `endif
 
 // -- Output writer --------------------------------------------------------------------------------
-for (genvar I = 0; I < NUM_OUTPUT_STREAMS; I++) begin : gen_out_skid_buffers
+for (genvar I = 0; I < NUM_PORTS; I++) begin : gen_out_skid_buffers
     AXISkidBuffer inst_out_skid_buffer (
         .clk(clk),
         .rst_n(rst_n),
@@ -300,9 +300,9 @@ end
 
 AXI4SR axi_send[NUM_STREAMS](.aclk(clk), .aresetn(rst_n));
 
-PairedOutputWriter #(
-    .N_CHANNELS(NUM_STREAMS),
-    .N_OUTPUTS(OUTPUTS_PER_CHANNEL)
+OutputWriter #(
+    .NUM_STREAMS(NUM_STREAMS),
+    .PORTS_PER_STREAM(PORTS_PER_STREAM)
 ) inst_output_writer (
     .clk(clk),
     .rst_n(rst_n),
@@ -314,7 +314,9 @@ PairedOutputWriter #(
     .mem_config(mem_conf),
 
     .data_in(axi_out),
-    .data_out(axi_send)
+    .data_out(axi_send),
+
+    .notify_count() // Unused: oasis has no GenericConfig to expose it
 );
 
 typedef struct packed {

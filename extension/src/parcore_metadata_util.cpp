@@ -127,14 +127,22 @@ parcore::metadata::Metadata BuildParcoreMetadata(ParquetReader &parquet_reader) 
 			// definition levels and is not is_required.
 			parcore_cc.is_required = leaves[col_idx].max_define == 0;
 			parcore_cc.logical_width = leaves[col_idx].logical_width;
-			// A string chunk listing a dictionary encoding is decoded into a dictionary vector. This
-			// assumes no PLAIN fallback within the chunk, as DuckDB writes them.
+			// What parcore::can_defer_dict_decoding needs to decide whether the chunk may be decoded
+			// into a dictionary vector. A chunk listing a dictionary encoding is assumed to have no
+			// PLAIN data page, as DuckDB writes them (it decides per chunk, without a fallback).
 			for (auto encoding : cmd.encodings) {
 				if (encoding == duckdb_parquet::Encoding::RLE_DICTIONARY ||
 				    encoding == duckdb_parquet::Encoding::PLAIN_DICTIONARY) {
 					parcore_cc.is_dictionary_encoded = true;
 				}
 			}
+			// A REQUIRED leaf has no NULLs, whether or not the writer wrote statistics.
+			if (parcore_cc.is_required) {
+				parcore_cc.null_count = 0;
+			} else if (cmd.__isset.statistics && cmd.statistics.__isset.null_count) {
+				parcore_cc.null_count = static_cast<uint64_t>(cmd.statistics.null_count);
+			}
+			parcore_cc.total_uncompressed_size = static_cast<uint64_t>(cmd.total_uncompressed_size);
 
 			parcore_rg.chunks.push_back(std::move(parcore_cc));
 		}

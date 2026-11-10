@@ -1,0 +1,152 @@
+# name: test/sql/oasis_dictionary_vectors.test
+# description: read_oasis emits dictionary encoded string chunks decoded on the FPGA as dictionary vectors
+# group: [oasis]
+
+require oasis
+
+require parquet
+
+# With defer_dict_decoding the decoder writes a chunk's dictionary followed by one index per row,
+# 1 byte wide for up to 256 entries, 2 bytes for up to 65,536 and 4 bytes above. The scan wraps the
+# dictionary in a DictionaryEntry and the indices in the selection of each vector (widened to sel_t
+# for 1 and 2 byte indices). The strings are 1 to 33 bytes long, so both inline (<= 12 bytes) and
+# heap strings occur. The columns have no NULLs but are OPTIONAL (no NOT NULL), so the scan relies on
+# the chunks' null_count statistics.
+
+statement ok
+COPY (SELECT 'k' || id::VARCHAR || repeat('x', id % 30) AS s, i
+      FROM (SELECT (range * 7919) % 100 AS id, range AS i FROM range(2000)))
+TO '__TEST_DIR__/dict_1byte.parquet' (FORMAT PARQUET);
+
+statement ok
+COPY (SELECT 'k' || id::VARCHAR || repeat('x', id % 30) AS s, i
+      FROM (SELECT (range * 7919) % 3000 AS id, range AS i FROM range(20000)))
+TO '__TEST_DIR__/dict_2byte.parquet' (FORMAT PARQUET);
+
+# More than 65,536 entries; DuckDB's default limit of rows / 5 entries would write PLAIN
+statement ok
+COPY (SELECT 'k' || id::VARCHAR || repeat('x', id % 30) AS s, i
+      FROM (SELECT (range * 7919) % 66000 AS id, range AS i FROM range(70000)))
+TO '__TEST_DIR__/dict_4byte.parquet' (FORMAT PARQUET, DICTIONARY_SIZE_LIMIT 100000);
+
+# DuckDB decides per column chunk: a dictionary for the first row group, PLAIN for the second, whose
+# values are all distinct
+statement ok
+COPY (SELECT CASE WHEN range < 122880 THEN 'k' || (range % 100)::VARCHAR || repeat('x', range % 100 % 30)
+                  ELSE 'u' || range::VARCHAR || repeat('y', range % 20) END AS s,
+             range AS i
+      FROM range(245760) ORDER BY range)
+TO '__TEST_DIR__/dict_and_plain.parquet' (FORMAT PARQUET, ROW_GROUP_SIZE 122880);
+
+# A dictionary encoded chunk with NULLs is decoded into german strings: the decoder writes one index
+# per non-NULL value only
+statement ok
+COPY (SELECT CASE WHEN range % 7 = 0 THEN NULL ELSE 'k' || (range % 100)::VARCHAR || repeat('x', range % 100 % 30) END AS s,
+             range AS i
+      FROM range(2000))
+TO '__TEST_DIR__/dict_nulls.parquet' (FORMAT PARQUET);
+
+# ---------------------------------------------------------------------------
+# Dictionary vectors, one per index width
+# ---------------------------------------------------------------------------
+
+foreach width 1byte 2byte 4byte
+
+query I
+SELECT DISTINCT vector_type(s) FROM read_oasis('__TEST_DIR__/dict_${width}.parquet');
+----
+DICTIONARY_VECTOR
+
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('__TEST_DIR__/dict_${width}.parquet')
+                              EXCEPT ALL FROM read_parquet('__TEST_DIR__/dict_${width}.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('__TEST_DIR__/dict_${width}.parquet')
+                              EXCEPT ALL FROM read_oasis('__TEST_DIR__/dict_${width}.parquet')));
+----
+0
+
+# Each row keeps its own value, not just the multiset of values
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/dict_${width}.parquet') o
+JOIN read_parquet('__TEST_DIR__/dict_${width}.parquet') p USING (i)
+WHERE o.s IS DISTINCT FROM p.s;
+----
+0
+
+# The string column on its own
+query II
+SELECT count(*) = (SELECT count(*) FROM read_parquet('__TEST_DIR__/dict_${width}.parquet')),
+       count(DISTINCT s) = (SELECT count(DISTINCT s) FROM read_parquet('__TEST_DIR__/dict_${width}.parquet'))
+FROM read_oasis('__TEST_DIR__/dict_${width}.parquet');
+----
+true	true
+
+endloop
+
+# ---------------------------------------------------------------------------
+# Dictionary and PLAIN chunks of the same column
+# ---------------------------------------------------------------------------
+
+query II
+SELECT vector_type(s) AS t, count(*) FROM read_oasis('__TEST_DIR__/dict_and_plain.parquet') GROUP BY t ORDER BY t;
+----
+DICTIONARY_VECTOR	122880
+FLAT_VECTOR	122880
+
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/dict_and_plain.parquet') o
+JOIN read_parquet('__TEST_DIR__/dict_and_plain.parquet') p USING (i)
+WHERE o.s IS DISTINCT FROM p.s;
+----
+0
+
+# ---------------------------------------------------------------------------
+# Pushed-down filters on a dictionary column
+# ---------------------------------------------------------------------------
+
+query II
+SELECT count(*), min(i) FROM read_oasis('__TEST_DIR__/dict_2byte.parquet') WHERE s = 'k1234' || repeat('x', 1234 % 30);
+----
+7	1886
+
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('__TEST_DIR__/dict_2byte.parquet') WHERE s LIKE 'k12%'
+                              EXCEPT ALL FROM read_parquet('__TEST_DIR__/dict_2byte.parquet') WHERE s LIKE 'k12%'))
+     + (SELECT count(*) FROM (FROM read_parquet('__TEST_DIR__/dict_2byte.parquet') WHERE s LIKE 'k12%'
+                              EXCEPT ALL FROM read_oasis('__TEST_DIR__/dict_2byte.parquet') WHERE s LIKE 'k12%'));
+----
+0
+
+# ---------------------------------------------------------------------------
+# Chunks that are not emitted as dictionary vectors
+# ---------------------------------------------------------------------------
+
+query I
+SELECT DISTINCT vector_type(s) FROM read_oasis('__TEST_DIR__/dict_nulls.parquet');
+----
+FLAT_VECTOR
+
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/dict_nulls.parquet') o
+JOIN read_parquet('__TEST_DIR__/dict_nulls.parquet') p USING (i)
+WHERE o.s IS DISTINCT FROM p.s;
+----
+0
+
+statement ok
+SET oasis_dictionary_vectors = false;
+
+query I
+SELECT DISTINCT vector_type(s) FROM read_oasis('__TEST_DIR__/dict_1byte.parquet');
+----
+FLAT_VECTOR
+
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/dict_1byte.parquet') o
+JOIN read_parquet('__TEST_DIR__/dict_1byte.parquet') p USING (i)
+WHERE o.s IS DISTINCT FROM p.s;
+----
+0
+
+statement ok
+RESET oasis_dictionary_vectors;

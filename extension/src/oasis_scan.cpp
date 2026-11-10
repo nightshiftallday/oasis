@@ -209,9 +209,9 @@ static bool OasisScanPushdownCast(ClientContext &context, const TableFunctionPro
 //
 // Second, the heap has to fit one FPGA output buffer, in *every* group: the decoder walks the heap
 // linearly from a single base address, so a heap spilling into a second allocation would produce
-// records pointing outside it. Deciding this once per scan rather than per group keeps a column's
-// path stable -- the emit path would otherwise have to switch a column between the hardware and CPU
-// readers mid-scan, and the CPU reader's page state only exists if it was driven from the start.
+// records pointing outside it. This is decided once per scan, for every group; the offload ratios
+// then pick which of an eligible column's chunks are actually decoded in hardware
+// (OffloadStringChunks).
 static bool StringColumnFitsHardware(const OasisScanBindData &bind, size_t col_id) {
 	const auto &type = bind.column_types[col_id];
 	if (type.id() != LogicalTypeId::VARCHAR && type.id() != LogicalTypeId::BLOB) {
@@ -228,6 +228,67 @@ static bool StringColumnFitsHardware(const OasisScanBindData &bind, size_t col_i
 		}
 	}
 	return true;
+}
+
+// Whether the k-th of a column's chunks of one encoding is offloaded at `ratio`. Spreads
+// the offloaded chunks evenly over the row groups, e.g. every other one at 0.5, deterministically
+// so that runs are comparable.
+static bool OffloadChunk(uint64_t k, double ratio) {
+	return static_cast<uint64_t>(static_cast<double>(k + 1) * ratio) >
+	       static_cast<uint64_t>(static_cast<double>(k) * ratio);
+}
+
+// Picks which chunks of the hardware string columns are offloaded, per encoding: a chunk whose footer
+// lists a dictionary encoding by oasis_offload_dict_string_ratio, any other by
+// oasis_offload_plain_string_ratio. The others are decoded by DuckDB's ColumnReader, like a
+// CPU-path column, which works per group because the readers are recreated for every group.
+static void OffloadStringChunks(ClientContext &context, const OasisScanBindData &bind, OasisScanGlobalState &gstate) {
+	auto ratio_setting = [&](const char *name) {
+		Value val;
+		context.TryGetCurrentSetting(name, val);
+		return val.IsNull() ? 1.0 : val.GetValue<double>();
+	};
+	double const dict_ratio = ratio_setting("oasis_offload_dict_string_ratio");
+	double const plain_ratio = ratio_setting("oasis_offload_plain_string_ratio");
+
+	size_t const num_groups = bind.metadata.groups.size();
+	// [plain, dictionary] chunks offloaded and in total
+	uint64_t offloaded[2] = {0, 0};
+	uint64_t total[2] = {0, 0};
+	bool any_on_cpu = false;
+	std::vector<std::vector<bool>> on_cpu(num_groups, std::vector<bool>(gstate.projected_columns.size(), false));
+	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+		const auto &col = gstate.projected_columns[i];
+		if (col.is_cpu || !col.is_string) {
+			continue;
+		}
+		uint64_t seen[2] = {0, 0};
+		for (size_t group = 0; group < num_groups; group++) {
+			size_t const dict = bind.metadata.groups[group].chunks[col.column_id].is_dictionary_encoded ? 1 : 0;
+			bool const offload = OffloadChunk(seen[dict]++, dict ? dict_ratio : plain_ratio);
+			on_cpu[group][i] = !offload;
+			any_on_cpu |= !offload;
+			offloaded[dict] += offload;
+			total[dict]++;
+		}
+	}
+	if (total[0] + total[1] == 0) {
+		return;
+	}
+	gstate.offload_summary = StringUtil::Format("dictionary %llu/%llu, plain %llu/%llu",
+	                                            (unsigned long long)offloaded[1], (unsigned long long)total[1],
+	                                            (unsigned long long)offloaded[0], (unsigned long long)total[0]);
+	DUCKDB_LOG_DEBUG(context, "read_oasis offloads string chunks: %s", gstate.offload_summary.c_str());
+	if (any_on_cpu) {
+		gstate.string_chunk_on_cpu = std::move(on_cpu);
+		gstate.has_cpu_columns = true;
+	}
+}
+
+// Whether the chunk of projected column i in the group is decoded on the CPU.
+static bool ChunkOnCpu(const OasisScanGlobalState &gstate, size_t group, size_t i) {
+	return gstate.projected_columns[i].is_cpu ||
+	       (!gstate.string_chunk_on_cpu.empty() && gstate.string_chunk_on_cpu[group][i]);
 }
 
 unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -265,6 +326,10 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	Value narrow_val;
 	context.TryGetCurrentSetting("oasis_narrow_transfer", narrow_val);
 	gstate->narrow_transfer = !narrow_val.IsNull() && narrow_val.GetValue<bool>();
+
+	Value dictionary_vectors_val;
+	context.TryGetCurrentSetting("oasis_dictionary_vectors", dictionary_vectors_val);
+	gstate->dictionary_vectors = dictionary_vectors_val.IsNull() || dictionary_vectors_val.GetValue<bool>();
 
 	for (auto col_id : input.column_ids) {
 		const auto &chunk = bind_data.metadata.groups[0].chunks[col_id];
@@ -304,6 +369,8 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			gstate->has_cpu_columns = true;
 		}
 	}
+
+	OffloadStringChunks(context, bind_data, *gstate);
 
 	// filter_prune: When the plan consumes fewer columns than we scan (some are filter-only),
 	// remember which projected columns are emitted so the scan can skip decoding the rest and
@@ -435,22 +502,31 @@ static uint64_t RowGroupNumRows(const OasisScanBindData &bind, size_t group) {
 	return chunks.empty() ? 0 : chunks[0].num_values;
 }
 
+// The values buffer size of a hardware string chunk decoded with defer_dict_decoding, or nullopt if
+// it is not decoded that way. The host never parses the dictionary page header, so the buffer is
+// sized for the most dictionary entries the footer allows (parcore::max_deferred_dict_entries); the
+// written size then gives the actual count. A chunk whose bound does not fit one output buffer is
+// decoded into records instead: the layout is recovered from a single written size.
+static std::optional<uint64_t> DeferredValuesBufferSize(const OasisScanGlobalState &gstate,
+                                                        const ProjectedColumn &col,
+                                                        const parcore::metadata::ColumnChunk &cc) {
+	if (!gstate.dictionary_vectors || !col.is_string || !parcore::can_defer_dict_decoding(cc)) {
+		return std::nullopt;
+	}
+	uint64_t const size = parcore::max_deferred_output_bytes(parcore::deferred_value_bytes(cc.type), cc.num_values,
+	                                                         parcore::max_deferred_dict_entries(cc));
+	if (size > libstf::MAXIMUM_OUTPUT_WRITER_BUFFER_SIZE) {
+		return std::nullopt;
+	}
+	return size;
+}
+
 // Submits the whole row group as one QuerySplinter: one decode flow per hardware column and, on
 // the RDMA path, one raw bypass flow per CPU column fetching its compressed bytes. Each flow's
 // sink is tagged with the projection index. The consumer places the tagged batches into
 // hw_buffers[projection_index] / cpu_buffers[projection_index]. For RDMA, the hardware pulls bytes
-// straight into the streams. On the local path the hardware-column bytes are read coalesced, 
+// straight into the streams. On the local path the hardware-column bytes are read coalesced,
 // synchronously on the worker, before submission.
-// Upper bound of the dictionary buffer of a dictionary encoded string chunk. The host never parses
-// the dictionary page header, so the entry count is bounded from the footer: every PLAIN entry
-// carries a 4-byte length prefix within the chunk's uncompressed bytes, and a writer only adds
-// values it saw, so there are no more entries than values. The written size is reported back.
-static uint64_t DictionaryBufferSize(const OasisScanBindData &bind, size_t group, size_t col_id,
-                                     const parcore::metadata::ColumnChunk &cc) {
-	uint64_t const max_entries = std::min<uint64_t>(cc.num_values, bind.uncompressed_sizes[group][col_id] / 4);
-	return max_entries * libstf::size_of(parcore::metadata::GERMAN_STR_T);
-}
-
 static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, OasisScanGlobalState &gstate,
                           OasisScanLocalState &lstate, const OasisScanBindData &bind,
                           OasisScanLocalState::PendingGroup &pending) {
@@ -462,9 +538,11 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	pending.hw_slot.reserve(gstate.projected_columns.size());
 	pending.hw_chunks.reserve(gstate.projected_columns.size());
 	pending.narrowed.assign(gstate.projected_columns.size(), false);
+	pending.on_cpu.assign(gstate.projected_columns.size(), false);
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
-		if (col.is_cpu) {
+		pending.on_cpu[i] = ChunkOnCpu(gstate, group, i);
+		if (pending.on_cpu[i]) {
 			if (rdma) {
 				pending.cpu_slot.push_back(i);
 				pending.cpu_chunks.push_back(&bind.metadata.groups[group].chunks[col.column_id]);
@@ -528,7 +606,7 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 	oasis::QuerySplinter splinter;
 	splinter.streams.reserve(pending.hw_slot.size() + pending.cpu_slot.size());
 	pending.heap_buffers.assign(gstate.projected_columns.size(), nullptr);
-	pending.dict_buffers.assign(gstate.projected_columns.size(), nullptr);
+	pending.deferred.assign(gstate.projected_columns.size(), false);
 	pending.batches_remaining = pending.hw_slot.size();
 	for (size_t k = 0; k < pending.hw_slot.size(); k++) {
 		const auto &cc = *pending.hw_chunks[k];
@@ -557,26 +635,19 @@ static void PrefetchGroup(ClientContext &context, oasis::OasisContext &ctx, Oasi
 			pending.batches_remaining++;
 		}
 
-		// A dictionary encoded string chunk decodes into a DuckDB dictionary vector instead: one
-		// uint32_t index per row in the values buffer, plus the dictionary page's german_str_t
-		// records in a third buffer. The decoder recognizes such a chunk from its dictionary page,
-		// so this has to agree with the encodings in the footer (no PLAIN fallback, as DuckDB
-		// writes them).
-		std::shared_ptr<libstf::Buffer> dict_buffer;
-		bool const dict_vector = col.is_string && cc.is_dictionary_encoded;
-		if (dict_vector) {
-			dict_buffer = ctx.allocate_output_buffer(DictionaryBufferSize(bind, group, col.column_id, cc));
-			pending.dict_buffers[pending.hw_slot[k]] = dict_buffer;
-			pending.batches_remaining++;
-		}
+		// A dictionary encoded string chunk can instead be decoded into a DuckDB dictionary vector:
+		// with defer_dict_decoding, the values buffer receives the dictionary page's german_str_t
+		// records followed by one 1, 2 or 4 byte index per row (parcore::DeferredDictLayout). The
+		// records still point into the heap above.
+		auto const deferred_size = DeferredValuesBufferSize(gstate, col, cc);
+		pending.deferred[pending.hw_slot[k]] = deferred_size.has_value();
 
-		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(cc.compression, cc.num_values, type,
-		                                                                   cc.is_required, logical_type,
-		                                                                   heap_address));
-		size_t const value_size = dict_vector ? sizeof(sel_t) : libstf::size_of(logical_type);
-		auto sink_buffer = ctx.allocate_output_buffer(cc.num_values * value_size);
+		flow.push_back(std::make_unique<oasis::DecodeColumnChunkOperator>(
+		    cc.compression, cc.num_values, type, cc.is_required, logical_type, heap_address, deferred_size.has_value()));
+		auto sink_buffer =
+		    ctx.allocate_output_buffer(deferred_size.value_or(cc.num_values * libstf::size_of(logical_type)));
 		flow.push_back(std::make_unique<oasis::LocalSinkOperator>(std::move(sink_buffer), pending.hw_slot[k],
-		                                                          std::move(heap_buffer), std::move(dict_buffer)));
+		                                                          std::move(heap_buffer)));
 		splinter.streams.push_back(std::move(flow));
 	}
 
@@ -646,8 +717,9 @@ static void InitGroupCPUColumns(ClientContext &context, OasisScanGlobalState &gs
 	// the next group. On the local path merging still pays off (fewer file reads).
 	const bool rdma_path =
 	    dynamic_cast<RDMAFileHandle *>(lstate.scan_state->file_handle->GetFileHandle().get()) != nullptr;
-	for (const auto &col : gstate.projected_columns) {
-		if (col.is_cpu) {
+	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
+		const auto &col = gstate.projected_columns[i];
+		if (lstate.current_on_cpu[i]) {
 			auto &reader = lstate.scan_state->GetColumnReader(col.column_id);
 			reader.InitializeRead(group, lstate.parquet_reader->GetFileMetadata()->row_groups[group].num_rows,
 			                      row_group_columns, *lstate.scan_state->thrift_file_proto);
@@ -681,18 +753,8 @@ static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate
 		DUCKDB_LOG_DEBUG(context, "Row group %llu, column %llu ('%s') returned %s batch",
 		                 (unsigned long long)pending.group, (unsigned long long)col_id,
 		                 bind.metadata.column_names[col_id].c_str(),
-		                 poll.batch->slot == oasis::OutputSlot::HEAP   ? "heap"
-		                 : poll.batch->slot == oasis::OutputSlot::DICT ? "dictionary"
-		                                                               : "values");
-		if (poll.batch->slot == oasis::OutputSlot::DICT) {
-			// Like the heap, the dictionary buffer was allocated at submission; the batch carries it
-			// back with its written size, which gives the number of dictionary entries.
-			if (!pending.dict_buffers[tag] || pending.dict_buffers[tag] != poll.batch->buffer) {
-				throw InternalException("Row group %llu, column %llu ('%s') produced an unexpected dictionary batch",
-				                        (unsigned long long)pending.group, (unsigned long long)col_id,
-				                        bind.metadata.column_names[col_id].c_str());
-			}
-		} else if (poll.batch->slot == oasis::OutputSlot::HEAP) {
+		                 poll.batch->slot == oasis::OutputSlot::HEAP ? "heap" : "values");
+		if (poll.batch->slot == oasis::OutputSlot::HEAP) {
 			// The heap buffer was allocated at submission and is already in heap_buffers; the batch
 			// carries the same buffer back with its written size filled in. More than one would mean
 			// the heap spilled across allocations, which would leave the records pointing outside
@@ -702,7 +764,7 @@ static bool TryCollectGroup(ClientContext &context, OasisScanGlobalState &gstate
 				                        (unsigned long long)pending.group, (unsigned long long)col_id,
 				                        bind.metadata.column_names[col_id].c_str());
 			}
-		} else if (col.is_cpu) {
+		} else if (pending.on_cpu[tag]) {
 			pending.cpu_buffers[tag].push_back(std::move(poll.batch->buffer));
 		} else {
 			pending.hw_buffers[tag] = std::move(poll.batch->buffer);
@@ -798,33 +860,42 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 
 	lstate.current_buffers = std::move(head.hw_buffers);
 	lstate.current_narrowed = std::move(head.narrowed);
+	lstate.current_on_cpu = std::move(head.on_cpu);
 	lstate.current_heap_buffers = std::move(head.heap_buffers);
 	lstate.current_dictionaries.assign(gstate.projected_columns.size(), nullptr);
-	for (size_t i = 0; i < head.dict_buffers.size(); i++) {
-		auto &dict = head.dict_buffers[i];
-		if (!dict) {
+	lstate.current_dict_layouts.assign(gstate.projected_columns.size(), parcore::DeferredDictLayout {});
+	for (size_t i = 0; i < head.deferred.size(); i++) {
+		if (!head.deferred[i]) {
 			continue;
 		}
-		if (dict->size % sizeof(string_t) != 0) {
-			throw InternalException("Row group %llu, column %llu: dictionary of %llu bytes is not a string_t array",
-			                        (unsigned long long)head.group, (unsigned long long)i,
-			                        (unsigned long long)dict->size);
-		}
-		// Zero-copy: the entry's child vector is the hardware-written string_t array. It pins the
-		// dictionary and the heap its records point into, for as long as any vector uses the entry.
+		const auto col_id = gstate.projected_columns[i].column_id;
+		auto &buf = lstate.current_buffers[i];
 		auto &heap = lstate.current_heap_buffers[i];
-		if (!heap) {
-			throw InternalException("Dictionary encoded string column %llu has no string heap buffer",
-			                        (unsigned long long)i);
+		if (!buf || !heap) {
+			throw InternalException("Row group %llu, column %llu ('%s'): dictionary column without values or heap buffer",
+			                        (unsigned long long)head.group, (unsigned long long)col_id,
+			                        bind.metadata.column_names[col_id].c_str());
 		}
-		// VARCHAR or BLOB: Vector::Dictionary requires the entry to have the vector's type.
-		const auto &type = bind.column_types[gstate.projected_columns[i].column_id];
-		idx_t const dict_size = dict->size / sizeof(string_t);
-		auto entry = make_buffer<DictionaryEntry>(Vector(type, reinterpret_cast<data_ptr_t>(dict->ptr), dict_size));
-		entry->data.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(dict));
+		// The written size gives the dictionary's entry count, and with it the index width
+		auto const layout = parcore::deferred_dict_layout(libstf::size_of(parcore::metadata::GERMAN_STR_T),
+		                                                  head.num_rows, buf->size);
+		if (!layout) {
+			throw InternalException("Row group %llu, column %llu ('%s'): %llu bytes are no dictionary of %llu rows",
+			                        (unsigned long long)head.group, (unsigned long long)col_id,
+			                        bind.metadata.column_names[col_id].c_str(), (unsigned long long)buf->size,
+			                        (unsigned long long)head.num_rows);
+		}
+		// Zero-copy: the entry's child vector is the hardware-written string_t array at the start of
+		// the values buffer. It pins that buffer and the heap its records point into, for as long as
+		// any vector uses the entry. VARCHAR or BLOB: Vector::Dictionary requires the entry to have
+		// the vector's type.
+		auto entry = make_buffer<DictionaryEntry>(
+		    Vector(bind.column_types[col_id], reinterpret_cast<data_ptr_t>(buf->ptr), layout->num_entries));
+		entry->data.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
 		entry->data.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(heap));
 		entry->id = UUID::ToString(UUID::GenerateRandomUUID());
 		lstate.current_dictionaries[i] = std::move(entry);
+		lstate.current_dict_layouts[i] = *layout;
 	}
 	lstate.current_needs_row_filter = std::move(head.needs_row_filter);
 	lstate.current_buf_offset = 0;
@@ -860,6 +931,32 @@ static LoadResult GetNextGroup(ClientContext &context, oasis::OasisContext &ctx,
 	return LoadResult::LOADED;
 }
 
+// The selection of a dictionary vector over count indices of index_bytes each. 4 byte indices are
+// sel_t, so the selection points into the values buffer, zero-copy: the DictionaryBuffer keeps only
+// that pointer, but its DictionaryEntry pins the buffer, which also holds the dictionary. 1 and 2
+// byte indices are widened into a selection of its own, which the DictionaryBuffer shares -- DuckDB
+// has a single selection width.
+static SelectionVector DictionarySelection(const uint8_t *indices, uint32_t index_bytes, idx_t count) {
+	if (index_bytes == sizeof(sel_t)) {
+		return SelectionVector(reinterpret_cast<sel_t *>(const_cast<uint8_t *>(indices)), count);
+	}
+	SelectionVector sel(count);
+	sel_t *dst = sel.data();
+	if (index_bytes == 1) {
+		for (idx_t r = 0; r < count; r++) {
+			dst[r] = indices[r];
+		}
+	} else {
+		D_ASSERT(index_bytes == 2);
+		// Aligned: the indices start after the 16 byte records of the dictionary
+		auto const src = reinterpret_cast<const uint16_t *>(indices);
+		for (idx_t r = 0; r < count; r++) {
+			dst[r] = src[r];
+		}
+	}
+	return sel;
+}
+
 struct SliceResult {
 	size_t rows = 0;                      // Rows surviving the pushed-down filters (0 with LOADED
 	                                      // means the slice was fully filtered -- try the next one).
@@ -892,32 +989,31 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 
 	for (size_t i = 0; i < gstate.projected_columns.size(); i++) {
 		const auto &col = gstate.projected_columns[i];
-		if (col.is_cpu) {
+		if (lstate.current_on_cpu[i]) {
 			continue; // Decoded by DecodeAndFilterSlice below.
 		}
 
 		auto &buf = lstate.current_buffers[i];
+		auto &vec = scan_chunk.data[i];
+
+		// Dictionary vector: a slice of the group's indices over its shared dictionary. The layout
+		// was checked against the row count when the group was loaded. The indices are not bounds
+		// checked: files are assumed not to be corrupted.
+		if (auto &dictionary = lstate.current_dictionaries[i]) {
+			const auto &layout = lstate.current_dict_layouts[i];
+			auto const indices = reinterpret_cast<const uint8_t *>(buf->ptr) + layout.indices_offset() +
+			                     lstate.current_buf_offset * layout.index_bytes;
+			vec.Dictionary(dictionary, DictionarySelection(indices, layout.index_bytes, emit), emit);
+			continue;
+		}
+
 		const bool narrowed = lstate.current_narrowed[i];
-		auto &dictionary = lstate.current_dictionaries[i];
-		const size_t transfer_size = narrowed || dictionary ? sizeof(int32_t) : col.elem_size;
+		const size_t transfer_size = narrowed ? sizeof(int32_t) : col.elem_size;
 		if (buf->size / transfer_size != total_elements) {
 			throw InternalException(
 			    "ParCore buffer layout mismatch across columns: column %llu has %llu elements, expected %llu",
 			    (unsigned long long)i, (unsigned long long)(buf->size / transfer_size),
 			    (unsigned long long)total_elements);
-		}
-
-		auto &vec = scan_chunk.data[i];
-
-		// Dictionary encoded string column: the selection is a slice of the hardware-written index
-		// buffer (sel_t is uint32_t) over the group's shared dictionary, zero-copy as well. The
-		// DictionaryBuffer keeps only a pointer to the selection, so the index buffer is pinned on it.
-		// The indices are not bounds checked: files are assumed not to be corrupted.
-		if (dictionary) {
-			SelectionVector sel(reinterpret_cast<sel_t *>(buf->ptr) + lstate.current_buf_offset, emit);
-			vec.Dictionary(dictionary, sel, emit);
-			vec.AddAuxiliaryData(make_uniq<LibstfBufferVectorBuffer>(buf));
-			continue;
 		}
 
 		vec.SetVectorType(VectorType::FLAT_VECTOR);
@@ -985,6 +1081,7 @@ static SliceResult EmitOneSlice(ClientContext &context, oasis::OasisContext &ctx
 		lstate.current_buffers.assign(gstate.projected_columns.size(), nullptr);
 		lstate.current_heap_buffers.assign(gstate.projected_columns.size(), nullptr);
 		lstate.current_dictionaries.assign(gstate.projected_columns.size(), nullptr);
+		lstate.current_dict_layouts.clear();
 		lstate.current_buf_offset = 0;
 		lstate.current_group_num_rows = 0;
 	}
@@ -1098,6 +1195,9 @@ void OasisScanGetMetrics(TableFunctionGetMetricsInput &input) {
 	auto seconds = [](uint64_t ns) { return StringUtil::Format("%.4fs", static_cast<double>(ns) / 1e9); };
 	if (gstate.filters) {
 		input.operator_metrics.AddExtraInfo("Filter Time", seconds(gstate.filter_time_ns.load()));
+	}
+	if (!gstate.offload_summary.empty()) {
+		input.operator_metrics.AddExtraInfo("Offloaded String Chunks", gstate.offload_summary);
 	}
 	if (gstate.has_cpu_columns) {
 		// Only the columns that fell back to DuckDB's ColumnReader. String columns eligible for the

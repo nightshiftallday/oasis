@@ -25,9 +25,8 @@ namespace oasis {
  * reorder batches by tag if needed. It can start working on early batches while the hardware is
  * still producing later ones.
  *
- * A string flow produces batches on several of its channel's logical streams, and they share the
- * sink's tag, so `slot` says which one a batch is: decoded values (or dictionary indices), the string
- * heap, or the string dictionary.
+ * A string flow produces batches on both of its channel's logical streams, and they share the sink's
+ * tag, so `slot` says which one a batch is: decoded values or the string heap they point into.
  */
 class SplinterResultChannel {
   public:

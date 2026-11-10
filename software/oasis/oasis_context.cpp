@@ -62,19 +62,20 @@ OasisContext::OasisContext(std::shared_ptr<libstf::MemoryPool> memory_pool)
 
     // The hardware exposes one read-request stream (= one physical channel) per column-chunk
     // decoder, plus an extra bypass channel when RDMA is wired in. If the counts match, RDMA wasn't
-    // synthesized into this shell. Deliberately not derived from MemConfig: PairedOutputWriter gives
-    // each channel OUTPUT_STREAMS_PER_CHANNEL MemConfig slots, so that count is a multiple of the
-    // channel count either way.
+    // synthesized into this shell.
     rdma_enabled_ = read_req_config->num_streams() != cc_config->num_decoders();
 
-    if (mem_config_->num_streams() !=
-        read_req_config->num_streams() * OUTPUT_STREAMS_PER_CHANNEL) {
+    // The OutputWriter has a MemConfig slot per port: two per decoder (values + string heap), one for
+    // the RDMA bypass channel (values only).
+    const size_t expected_output_streams =
+        cc_config->num_decoders() * OUTPUT_STREAMS_PER_CHANNEL + (rdma_enabled_ ? 1 : 0);
+    if (mem_config_->num_streams() != expected_output_streams) {
         std::ostringstream msg;
         msg << "Hardware reports " << mem_config_->num_streams() << " output streams for "
-            << read_req_config->num_streams() << " channels; expected "
-            << OUTPUT_STREAMS_PER_CHANNEL
-            << " per channel (values + string heap + string dictionary). The bitstream and this host disagree about the "
-               "output-stream layout.";
+            << cc_config->num_decoders() << " decoders" << (rdma_enabled_ ? " and an RDMA bypass" : "")
+            << "; expected " << expected_output_streams << " (values + string heap per decoder"
+            << (rdma_enabled_ ? ", values for the bypass" : "")
+            << "). The bitstream and this host disagree about the output-stream layout.";
         throw std::runtime_error(msg.str());
     }
 

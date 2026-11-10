@@ -13,4 +13,7 @@ void SetSchedulerNumStreams(ClientContext &context, SetScope scope, Value &param
 
 void SetSchedulerQueueDepth(ClientContext &context, SetScope scope, Value &parameter);
 
+// Validates oasis_offload_dict_string_ratio and oasis_offload_plain_string_ratio: a share in [0, 1].
+void ValidateOffloadRatio(ClientContext &context, SetScope scope, Value &parameter);
+
 } // namespace duckdb
