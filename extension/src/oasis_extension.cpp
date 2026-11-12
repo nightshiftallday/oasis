@@ -69,6 +69,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "instead, which is the fallback ineligible columns already take.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption(
+	    "oasis_nic_mode",
+	    "Use the FPGA as a plain NIC instead of a SmartNIC: read_oasis decodes every column, numeric "
+	    "ones included, on the CPU with DuckDB's ColumnReader and configures no decoder. Over RDMA the "
+	    "FPGA still fetches the compressed column chunks, on the bypass stream; a local file is read by "
+	    "the CPU. Overrides oasis_hardware_strings, the offload ratios, oasis_narrow_transfer and "
+	    "oasis_cast_pushdown.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption(
 	    "oasis_dictionary_vectors",
 	    "Emit dictionary encoded string column chunks decoded on the FPGA as DuckDB dictionary vectors: "
 	    "the FPGA transfers the dictionary once plus a 1, 2 or 4 byte index per row instead of a "

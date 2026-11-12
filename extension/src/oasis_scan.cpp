@@ -138,6 +138,13 @@ static std::optional<libstf::type_t> CastHardwareType(const LogicalType &type) {
 	}
 }
 
+// SET oasis_nic_mode = true: the FPGA is used as a plain NIC and every column is decoded on the CPU.
+static bool NicModeEnabled(ClientContext &context) {
+	Value nic_mode_val;
+	context.TryGetCurrentSetting("oasis_nic_mode", nic_mode_val);
+	return !nic_mode_val.IsNull() && nic_mode_val.GetValue<bool>();
+}
+
 // DuckDB's TYPE_PUSHDOWN offers the cast of a column that the query only uses cast, e.g. the
 // BIGINT -> INTEGER casts of compressed join keys. We accept integer narrowing casts that the
 // decoders can do, when the file statistics prove that every value fits the target type: Then the
@@ -150,6 +157,11 @@ static bool OasisScanPushdownCast(ClientContext &context, const TableFunctionPro
 	Value pushdown_val;
 	context.TryGetCurrentSetting("oasis_cast_pushdown", pushdown_val);
 	if (pushdown_val.IsNull() || !pushdown_val.GetValue<bool>()) {
+		return false;
+	}
+	// The cast is done by the decoders, which NIC mode does not use: DuckDB's ColumnReader yields
+	// the column's own type.
+	if (NicModeEnabled(context)) {
 		return false;
 	}
 
@@ -331,9 +343,14 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 	context.TryGetCurrentSetting("oasis_dictionary_vectors", dictionary_vectors_val);
 	gstate->dictionary_vectors = dictionary_vectors_val.IsNull() || dictionary_vectors_val.GetValue<bool>();
 
+	// NIC mode: the FPGA only moves bytes. Every column, numeric ones included, takes the CPU path,
+	// so no decoder is configured; over RDMA the compressed chunks still arrive through the FPGA,
+	// on the bypass stream.
+	bool const nic_mode = NicModeEnabled(context);
+
 	for (auto col_id : input.column_ids) {
 		const auto &chunk = bind_data.metadata.groups[0].chunks[col_id];
-		if (parcore::metadata::is_libstf_type(chunk.type)) {
+		if (!nic_mode && parcore::metadata::is_libstf_type(chunk.type)) {
 			const auto &column_type = bind_data.output_types[col_id];
 			// A cast pushed into the scan is done by the decoders
 			std::optional<libstf::type_t> cast_type;
@@ -357,14 +374,23 @@ unique_ptr<GlobalTableFunctionState> OasisScanInitGlobal(ClientContext &context,
 			    (column_type.id() == LogicalTypeId::BIGINT ||
 			     (column_type.id() == LogicalTypeId::DECIMAL && column_type.InternalType() == PhysicalType::INT64));
 			gstate->projected_columns.push_back({col_id, duckdb_size, false, narrowable, cast_type});
-		} else if (hardware_strings && parcore::metadata::is_string_type(chunk.type) &&
+		} else if (!nic_mode && hardware_strings && parcore::metadata::is_string_type(chunk.type) &&
 		           StringColumnFitsHardware(bind_data, col_id)) {
 			// Hardware path: BYTE_ARRAY decoded into german_str_t records, which are bit-for-bit
 			// duckdb::string_t, plus a string heap the records point into.
 			gstate->projected_columns.push_back(
 			    {col_id, libstf::size_of(parcore::metadata::GERMAN_STR_T), false, false, std::nullopt, true});
 		} else {
-			// CPU path: Variable-length type decoded by DuckDB's ColumnReader.
+			// A cast accepted while planning (oasis_nic_mode was off then, e.g. a prepared statement)
+			// can only be done by the decoders.
+			if (bind_data.output_types[col_id] != bind_data.column_types[col_id]) {
+				throw InvalidInputException(
+				    "read_oasis: column '%s' was planned with a cast pushed into the scan, which oasis_nic_mode "
+				    "cannot do. Plan the query again with oasis_nic_mode set.",
+				    bind_data.metadata.column_names[col_id].c_str());
+			}
+			// CPU path: Variable-length type (or any column in NIC mode) decoded by DuckDB's
+			// ColumnReader.
 			gstate->projected_columns.push_back({col_id, 0, true, false});
 			gstate->has_cpu_columns = true;
 		}

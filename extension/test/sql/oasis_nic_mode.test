@@ -1,0 +1,86 @@
+# name: test/sql/oasis_nic_mode.test
+# description: oasis_nic_mode, which decodes every column (numeric ones included) on the CPU
+# group: [oasis]
+
+require oasis
+
+require parquet
+
+# Fixed-width columns of several types (with NULLs), a plain and a dictionary encoded string column,
+# and a short final row group (20000 rows at 8192 per group).
+statement ok
+COPY (SELECT i::INTEGER AS a, (i * 1000000)::BIGINT AS b, i / 7.0 AS d, (i % 1000)::DECIMAL(12, 2) AS m,
+             DATE '2020-01-01' + (i % 365)::INTEGER AS dt, CASE WHEN i % 5 = 0 THEN NULL ELSE i END AS n,
+             'str' || i AS s, ['alpha', 'beta', 'gamma', 'delta'][(i % 4) + 1] AS g
+      FROM range(0, 20000) t(i))
+TO '__TEST_DIR__/nic_mode.parquet' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 8192);
+
+query T
+SELECT current_setting('oasis_nic_mode');
+----
+false
+
+statement ok
+SET oasis_nic_mode = true;
+
+# ---------------------------------------------------------------------------
+# Full scan, projections and filters match DuckDB's own Parquet reader
+# ---------------------------------------------------------------------------
+
+query I
+SELECT (SELECT count(*) FROM (FROM read_oasis('__TEST_DIR__/nic_mode.parquet')
+                              EXCEPT ALL FROM read_parquet('__TEST_DIR__/nic_mode.parquet')))
+     + (SELECT count(*) FROM (FROM read_parquet('__TEST_DIR__/nic_mode.parquet')
+                              EXCEPT ALL FROM read_oasis('__TEST_DIR__/nic_mode.parquet')));
+----
+0
+
+# Only numeric columns: these would otherwise all be decoded on the FPGA.
+query IIII
+SELECT count(*), sum(a), sum(b), count(n) FROM read_oasis('__TEST_DIR__/nic_mode.parquet');
+----
+20000	199990000	199990000000000	16000
+
+# Filters on numeric columns, evaluated by DuckDB's ColumnReader.
+query III
+SELECT count(*), min(a), max(a) FROM read_oasis('__TEST_DIR__/nic_mode.parquet') WHERE a BETWEEN 8000 AND 8400 AND b % 2 = 0;
+----
+401	8000	8400
+
+query I
+SELECT count(*) FROM read_oasis('__TEST_DIR__/nic_mode.parquet') WHERE dt = DATE '2020-01-01' AND g = 'alpha';
+----
+14
+
+# A filter-only column (filter pruning) next to an emitted one.
+query I
+SELECT sum(a) FROM read_oasis('__TEST_DIR__/nic_mode.parquet') WHERE s LIKE 'str1%';
+----
+151509596
+
+# ---------------------------------------------------------------------------
+# Cast pushdown is refused in NIC mode (the decoders would do the cast); DuckDB casts instead
+# ---------------------------------------------------------------------------
+
+statement ok
+SET oasis_cast_pushdown = true;
+
+query II
+SELECT sum(a::SMALLINT % 100), typeof(any_value(a::SMALLINT)) FROM read_oasis('__TEST_DIR__/nic_mode.parquet') WHERE a < 1000;
+----
+49500	SMALLINT
+
+statement ok
+RESET oasis_cast_pushdown;
+
+# ---------------------------------------------------------------------------
+# Switching back: the same queries with the FPGA decoding
+# ---------------------------------------------------------------------------
+
+statement ok
+SET oasis_nic_mode = false;
+
+query IIII
+SELECT count(*), sum(a), sum(b), count(n) FROM read_oasis('__TEST_DIR__/nic_mode.parquet');
+----
+20000	199990000	199990000000000	16000
